@@ -7,24 +7,27 @@ import 'dart:async';
 import 'dart:convert';
 import 'package:dart_mcp/server.dart';
 import 'storage.dart';
+import 'git_utils.dart';
 
 /// Main MCP server for ThreadBox providing file operations.
 base class ThreadBoxServer extends MCPServer with ToolsSupport {
   final FileStorage _storage;
+  final String _defaultSessionId;
 
-  ThreadBoxServer(super.channel, this._storage)
-    : super.fromStreamChannel(
+  ThreadBoxServer(super.channel, this._storage, {String? defaultSessionId})
+    : _defaultSessionId = defaultSessionId ?? getSessionId(),
+      super.fromStreamChannel(
         implementation: Implementation(
           name: 'ThreadBox MCP Server',
           version: '0.1.0',
         ),
         instructions: 'Virtual filesystem for AI agent artifacts with versioned storage',
       ) {
-    // Register MCP tools
+    // Register MCP tools for file operations
     registerTool(writeFileTool, _writeFile);
     registerTool(readFileTool, _readFile);
     registerTool(listDirectoryTool, _listDirectory);
-    registerTool(exportZipTool, _exportZip);
+    registerTool(exportSessionZipTool, _exportSessionZip);
   }
 
   /// Tool for writing files to storage.
@@ -33,14 +36,17 @@ base class ThreadBoxServer extends MCPServer with ToolsSupport {
     description: 'Write a file to the virtual filesystem with automatic versioning',
     inputSchema: Schema.object(
       properties: {
+        'sessionId': Schema.string(
+          description: 'Session ID for isolation (optional, auto-detected from Git worktree)',
+        ),
         'path': Schema.string(
-          description: 'The file path relative to the worktree',
+          description: 'The file path relative to the session root',
         ),
         'content': Schema.string(
           description: 'The file content (text or base64 encoded for binary)',
         ),
-        'worktree': Schema.string(
-          description: 'Optional Git worktree identifier for isolation',
+        'base64': Schema.bool(
+          description: 'Whether content is base64 encoded (default: false)',
         ),
       },
       required: ['path', 'content'],
@@ -53,11 +59,11 @@ base class ThreadBoxServer extends MCPServer with ToolsSupport {
     description: 'Read the latest version of a file from the virtual filesystem',
     inputSchema: Schema.object(
       properties: {
-        'path': Schema.string(
-          description: 'The file path relative to the worktree',
+        'sessionId': Schema.string(
+          description: 'Session ID for isolation (optional, auto-detected from Git worktree)',
         ),
-        'worktree': Schema.string(
-          description: 'Optional Git worktree identifier for isolation',
+        'path': Schema.string(
+          description: 'The file path relative to the session root',
         ),
       },
       required: ['path'],
@@ -70,31 +76,28 @@ base class ThreadBoxServer extends MCPServer with ToolsSupport {
     description: 'List all files in a directory from the virtual filesystem',
     inputSchema: Schema.object(
       properties: {
-        'path': Schema.string(
-          description: 'The directory path relative to the worktree',
+        'sessionId': Schema.string(
+          description: 'Session ID for isolation (optional, auto-detected from Git worktree)',
         ),
-        'worktree': Schema.string(
-          description: 'Optional Git worktree identifier for isolation',
+        'path': Schema.string(
+          description: 'The directory path relative to the session root',
         ),
       },
       required: ['path'],
     ),
   );
 
-  /// Tool for exporting files as a ZIP archive.
-  final exportZipTool = Tool(
-    name: 'export_zip',
-    description: 'Export files from a directory as a ZIP archive',
+  /// Tool for exporting session as ZIP.
+  final exportSessionZipTool = Tool(
+    name: 'export_session_zip',
+    description: 'Export all files from a session as a ZIP archive',
     inputSchema: Schema.object(
       properties: {
-        'path': Schema.string(
-          description: 'The directory path to export',
-        ),
-        'worktree': Schema.string(
-          description: 'Optional Git worktree identifier for isolation',
+        'sessionId': Schema.string(
+          description: 'Session ID to export (optional, auto-detected from Git worktree)',
         ),
       },
-      required: ['path'],
+      required: [],
     ),
   );
 
@@ -102,16 +105,26 @@ base class ThreadBoxServer extends MCPServer with ToolsSupport {
   FutureOr<CallToolResult> _writeFile(CallToolRequest request) async {
     final path = request.arguments!['path'] as String;
     final content = request.arguments!['content'] as String;
-    final worktree = request.arguments!['worktree'] as String?;
+    final sessionId = request.arguments!['sessionId'] as String? ?? _defaultSessionId;
+    final base64 = request.arguments!['base64'] as bool? ?? false;
 
     try {
-      final contentBytes = utf8.encode(content);
-      final id = await _storage.writeFile(path, contentBytes, worktree: worktree);
+      final contentBytes = base64 
+          ? base64Decode(content)
+          : utf8.encode(content);
+      
+      final id = await _storage.writeFile(path, contentBytes, sessionId: sessionId);
+
+      // Get version
+      final record = await _storage.readFile(path, sessionId: sessionId);
 
       return CallToolResult(
         content: [
           TextContent(
-            text: 'File written successfully with ID: $id',
+            text: jsonEncode({
+              'inodeId': id,
+              'version': record?.version ?? 1,
+            }),
           ),
         ],
       );
@@ -130,10 +143,10 @@ base class ThreadBoxServer extends MCPServer with ToolsSupport {
   /// Implementation of read_file tool.
   FutureOr<CallToolResult> _readFile(CallToolRequest request) async {
     final path = request.arguments!['path'] as String;
-    final worktree = request.arguments!['worktree'] as String?;
+    final sessionId = request.arguments!['sessionId'] as String? ?? _defaultSessionId;
 
     try {
-      final record = await _storage.readFile(path, worktree: worktree);
+      final record = await _storage.readFile(path, sessionId: sessionId);
 
       if (record == null) {
         return CallToolResult(
@@ -146,15 +159,26 @@ base class ThreadBoxServer extends MCPServer with ToolsSupport {
         );
       }
 
-      final content = utf8.decode(record.content);
+      // Try to decode as UTF-8, fallback to base64 for binary
+      String content;
+      bool isBase64 = false;
+      
+      try {
+        content = utf8.decode(record.content);
+      } catch (e) {
+        content = base64Encode(record.content);
+        isBase64 = true;
+      }
+
       return CallToolResult(
         content: [
           TextContent(
-            text: 'File: ${record.path}\n'
-                'Version: ${record.version}\n'
-                'ID: ${record.id}\n'
-                'Created: ${record.createdAt}\n\n'
-                '$content',
+            text: jsonEncode({
+              'content': content,
+              'base64': isBase64,
+              'version': record.version,
+              'inodeId': record.id,
+            }),
           ),
         ],
       );
@@ -173,26 +197,39 @@ base class ThreadBoxServer extends MCPServer with ToolsSupport {
   /// Implementation of list_directory tool.
   FutureOr<CallToolResult> _listDirectory(CallToolRequest request) async {
     final path = request.arguments!['path'] as String;
-    final worktree = request.arguments!['worktree'] as String?;
+    final sessionId = request.arguments!['sessionId'] as String? ?? _defaultSessionId;
 
     try {
-      final files = await _storage.listDirectory(path, worktree: worktree);
+      final files = await _storage.listDirectory(path, sessionId: sessionId);
 
-      if (files.isEmpty) {
-        return CallToolResult(
-          content: [
-            TextContent(
-              text: 'No files found in directory: $path',
-            ),
-          ],
-        );
+      final directories = <String>[];
+      final filesList = <String>[];
+
+      for (final file in files) {
+        // Extract just the filename/dirname
+        final relativePath = file.path.substring(path.length);
+        final cleanPath = relativePath.startsWith('/') 
+            ? relativePath.substring(1) 
+            : relativePath;
+        
+        if (file.isDirectory) {
+          // Remove trailing slash for directory names
+          final dirName = cleanPath.endsWith('/') 
+              ? cleanPath.substring(0, cleanPath.length - 1)
+              : cleanPath;
+          directories.add(dirName);
+        } else {
+          filesList.add(cleanPath);
+        }
       }
 
-      final listing = files.map((f) => '${f.path} (v${f.version}, ${f.id})').join('\n');
       return CallToolResult(
         content: [
           TextContent(
-            text: 'Files in $path:\n$listing',
+            text: jsonEncode({
+              'directories': directories,
+              'files': filesList,
+            }),
           ),
         ],
       );
@@ -208,24 +245,35 @@ base class ThreadBoxServer extends MCPServer with ToolsSupport {
     }
   }
 
-  /// Implementation of export_zip tool.
-  FutureOr<CallToolResult> _exportZip(CallToolRequest request) async {
-    final path = request.arguments!['path'] as String;
-    final worktree = request.arguments!['worktree'] as String?;
+  /// Implementation of export_session_zip tool.
+  FutureOr<CallToolResult> _exportSessionZip(CallToolRequest request) async {
+    final sessionId = request.arguments?['sessionId'] as String? ?? _defaultSessionId;
 
-    // Placeholder implementation
-    return CallToolResult(
-      content: [
-        TextContent(
-          text: 'ZIP export functionality will be implemented in future version.\n'
-              'Requested path: $path\n'
-              'Worktree: ${worktree ?? "none"}',
-        ),
-      ],
-    );
+    try {
+      final downloadPath = await _storage.exportSessionZip(sessionId);
+
+      return CallToolResult(
+        content: [
+          TextContent(
+            text: jsonEncode({
+              'downloadPath': downloadPath,
+            }),
+          ),
+        ],
+      );
+    } catch (e) {
+      return CallToolResult(
+        content: [
+          TextContent(
+            text: 'Error exporting session: $e',
+          ),
+        ],
+        isError: true,
+      );
+    }
   }
 
-  void dispose() {
-    _storage.close();
+  Future<void> dispose() async {
+    await _storage.close();
   }
 }

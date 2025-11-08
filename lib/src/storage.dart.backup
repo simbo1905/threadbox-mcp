@@ -4,12 +4,9 @@
 library;
 
 import 'dart:async';
-import 'dart:io';
-import 'dart:typed_data';
 import 'package:sqlite_async/sqlite_async.dart';
 import 'package:uuid/uuid.dart';
 import 'package:path/path.dart' as p;
-import 'package:archive/archive.dart';
 
 /// Manages file storage with append-only immutability and version history.
 class FileStorage {
@@ -34,7 +31,7 @@ class FileStorage {
         path TEXT NOT NULL,
         content BLOB NOT NULL,
         created_at INTEGER NOT NULL,
-        session_id TEXT,
+        worktree TEXT,
         version INTEGER NOT NULL DEFAULT 1,
         is_deleted INTEGER NOT NULL DEFAULT 0,
         parent_path TEXT,
@@ -48,7 +45,7 @@ class FileStorage {
     ''');
 
     await _db.execute('''
-      CREATE INDEX IF NOT EXISTS idx_files_session_id ON files(session_id)
+      CREATE INDEX IF NOT EXISTS idx_files_worktree ON files(worktree)
     ''');
 
     await _db.execute('''
@@ -61,7 +58,7 @@ class FileStorage {
   }
 
   /// Writes a file to storage and returns its UUID.
-  Future<String> writeFile(String path, List<int> content, {String? session_id, String? metadata}) async {
+  Future<String> writeFile(String path, List<int> content, {String? worktree, String? metadata}) async {
     final id = _uuid.v4();
     final timestamp = DateTime.now().millisecondsSinceEpoch;
     final parentPath = _getParentPath(path);
@@ -76,23 +73,23 @@ class FileStorage {
         : 1;
 
     await _db.execute(
-      'INSERT INTO files (id, path, content, created_at, session_id, version, is_deleted, parent_path, is_directory, metadata) '
+      'INSERT INTO files (id, path, content, created_at, worktree, version, is_deleted, parent_path, is_directory, metadata) '
       'VALUES (?, ?, ?, ?, ?, ?, 0, ?, 0, ?)',
-      [id, path, content, timestamp, sessionId, version, parentPath, metadata],
+      [id, path, content, timestamp, worktree, version, parentPath, metadata],
     );
 
     return id;
   }
 
   /// Creates a directory entry in the virtual filesystem.
-  Future<String> createDirectory(String path, {String? session_id, String? metadata}) async {
+  Future<String> createDirectory(String path, {String? worktree, String? metadata}) async {
     final id = _uuid.v4();
     final timestamp = DateTime.now().millisecondsSinceEpoch;
     final parentPath = _getParentPath(path);
     final normalizedPath = _normalizeDirPath(path);
 
     // Check if directory already exists
-    final existing = await readFile(normalizedPath, sessionId: sessionId);
+    final existing = await readFile(normalizedPath, worktree: worktree);
     if (existing != null && existing.isDirectory) {
       return existing.id;
     }
@@ -107,23 +104,23 @@ class FileStorage {
         : 1;
 
     await _db.execute(
-      'INSERT INTO files (id, path, content, created_at, session_id, version, is_deleted, parent_path, is_directory, metadata) '
+      'INSERT INTO files (id, path, content, created_at, worktree, version, is_deleted, parent_path, is_directory, metadata) '
       'VALUES (?, ?, ?, ?, ?, ?, 0, ?, 1, ?)',
-      [id, normalizedPath, <int>[], timestamp, sessionId, version, parentPath, metadata],
+      [id, normalizedPath, <int>[], timestamp, worktree, version, parentPath, metadata],
     );
 
     return id;
   }
 
   /// Reads the latest version of a file by path.
-  Future<FileRecord?> readFile(String path, {String? sessionId}) async {
-    final whereClause = sessionId != null
-        ? 'path = ? AND session_id = ?'
+  Future<FileRecord?> readFile(String path, {String? worktree}) async {
+    final whereClause = worktree != null
+        ? 'path = ? AND worktree = ?'
         : 'path = ?';
-    final params = sessionId != null ? [path, session_id] : [path];
+    final params = worktree != null ? [path, worktree] : [path];
 
     final result = await _db.getAll(
-      'SELECT id, path, content, created_at, session_id, version, is_directory, is_deleted, metadata FROM files '
+      'SELECT id, path, content, created_at, worktree, version, is_directory, is_deleted, metadata FROM files '
       'WHERE $whereClause ORDER BY version DESC LIMIT 1',
       params,
     );
@@ -139,7 +136,7 @@ class FileStorage {
       path: row['path'] as String,
       content: row['content'] as List<int>,
       createdAt: DateTime.fromMillisecondsSinceEpoch(row['created_at'] as int),
-      sessionId: row["session_id"] as String?,
+      worktree: row['worktree'] as String?,
       version: row['version'] as int,
       isDirectory: (row['is_directory'] as int) == 1,
       metadata: row['metadata'] as String?,
@@ -147,32 +144,32 @@ class FileStorage {
   }
 
   /// Lists all files in a directory (non-recursive).
-  Future<List<FileRecord>> listDirectory(String dirPath, {String? session_id, bool recursive = false}) async {
+  Future<List<FileRecord>> listDirectory(String dirPath, {String? worktree, bool recursive = false}) async {
     // Normalize directory path
     final normalizedPath = _normalizeDirPath(dirPath);
 
-    final whereClause = sessionId != null
-        ? 'path LIKE ? AND session_id = ?'
+    final whereClause = worktree != null
+        ? 'path LIKE ? AND worktree = ?'
         : 'path LIKE ?';
     
     final pattern = recursive ? '$normalizedPath%' : '$normalizedPath%';
-    final params = sessionId != null ? [pattern, session_id] : [pattern];
+    final params = worktree != null ? [pattern, worktree] : [pattern];
 
     // Get latest versions only, excluding the directory itself
     final result = await _db.getAll('''
       WITH LatestVersions AS (
-        SELECT path, MAX(version) as max_version, session_id
+        SELECT path, MAX(version) as max_version, worktree
         FROM files
         WHERE $whereClause
           AND path != ?
-        GROUP BY path, session_id
+        GROUP BY path, worktree
       )
-      SELECT f.id, f.path, f.content, f.created_at, f.session_id, f.version, f.is_directory, f.metadata
+      SELECT f.id, f.path, f.content, f.created_at, f.worktree, f.version, f.is_directory, f.metadata
       FROM files f
       INNER JOIN LatestVersions lv
         ON f.path = lv.path 
         AND f.version = lv.max_version
-        AND (f.session_id = lv.session_id OR (f.session_id IS NULL AND lv.session_id IS NULL))
+        AND (f.worktree = lv.worktree OR (f.worktree IS NULL AND lv.worktree IS NULL))
       WHERE f.is_deleted = 0
       ORDER BY f.path
     ''', [...params, normalizedPath]);
@@ -182,7 +179,7 @@ class FileStorage {
       path: row['path'] as String,
       content: row['content'] as List<int>,
       createdAt: DateTime.fromMillisecondsSinceEpoch(row['created_at'] as int),
-      sessionId: row["session_id"] as String?,
+      worktree: row['worktree'] as String?,
       version: row['version'] as int,
       isDirectory: (row['is_directory'] as int) == 1,
       metadata: row['metadata'] as String?,
@@ -208,12 +205,12 @@ class FileStorage {
   }
 
   /// Moves a file or directory to a new path.
-  Future<String> moveFile(String sourcePath, String destPath, {String? sessionId}) async {
+  Future<String> moveFile(String sourcePath, String destPath, {String? worktree}) async {
     // Try reading as file first, then as directory
-    var source = await readFile(sourcePath, sessionId: sessionId);
+    var source = await readFile(sourcePath, worktree: worktree);
     if (source == null) {
       // Try with trailing slash (directory)
-      source = await readFile(_normalizeDirPath(sourcePath), sessionId: sessionId);
+      source = await readFile(_normalizeDirPath(sourcePath), worktree: worktree);
       if (source == null) {
         throw Exception('Source file not found: $sourcePath');
       }
@@ -224,13 +221,13 @@ class FileStorage {
       final normalizedSource = _normalizeDirPath(sourcePath);
       final normalizedDest = _normalizeDirPath(destPath);
       
-      final children = await listDirectory(normalizedSource, sessionId: sessionId, recursive: true);
+      final children = await listDirectory(normalizedSource, worktree: worktree, recursive: true);
       
       // Move directory itself
       final dirId = await writeFile(
         normalizedDest,
         <int>[],
-        sessionId: session_id,
+        worktree: worktree,
         metadata: source.metadata,
       );
       
@@ -245,39 +242,39 @@ class FileStorage {
         if (child.path == normalizedSource) continue;
         final relativePath = child.path.substring(normalizedSource.length);
         final newPath = '$normalizedDest$relativePath';
-        await writeFile(newPath, child.content, sessionId: sessionId, metadata: child.metadata);
+        await writeFile(newPath, child.content, worktree: worktree, metadata: child.metadata);
       }
 
       // Mark source as deleted
-      await _markDeleted(normalizedSource, sessionId: sessionId);
+      await _markDeleted(normalizedSource, worktree: worktree);
       for (final child in children) {
-        await _markDeleted(child.path, sessionId: sessionId);
+        await _markDeleted(child.path, worktree: worktree);
       }
 
       return dirId;
     } else {
       // Move regular file
-      final newId = await writeFile(destPath, source.content, sessionId: sessionId, metadata: source.metadata);
-      await _markDeleted(sourcePath, sessionId: sessionId);
+      final newId = await writeFile(destPath, source.content, worktree: worktree, metadata: source.metadata);
+      await _markDeleted(sourcePath, worktree: worktree);
       return newId;
     }
   }
 
   /// Renames a file or directory.
-  Future<String> renameFile(String path, String newName, {String? sessionId}) async {
+  Future<String> renameFile(String path, String newName, {String? worktree}) async {
     // Extract parent directory preserving leading slash
     final lastSlash = path.lastIndexOf('/');
     final newPath = lastSlash >= 0 ? '${path.substring(0, lastSlash + 1)}$newName' : newName;
-    return moveFile(path, newPath, sessionId: sessionId);
+    return moveFile(path, newPath, worktree: worktree);
   }
 
   /// Copies a file or directory.
-  Future<String> copyFile(String sourcePath, String destPath, {String? sessionId}) async {
+  Future<String> copyFile(String sourcePath, String destPath, {String? worktree}) async {
     // Try reading as file first, then as directory
-    var source = await readFile(sourcePath, sessionId: sessionId);
+    var source = await readFile(sourcePath, worktree: worktree);
     if (source == null) {
       // Try with trailing slash (directory)
-      source = await readFile(_normalizeDirPath(sourcePath), sessionId: sessionId);
+      source = await readFile(_normalizeDirPath(sourcePath), worktree: worktree);
       if (source == null) {
         throw Exception('Source file not found: $sourcePath');
       }
@@ -287,32 +284,32 @@ class FileStorage {
       final normalizedSource = _normalizeDirPath(sourcePath);
       final normalizedDest = _normalizeDirPath(destPath);
       
-      final children = await listDirectory(normalizedSource, sessionId: sessionId, recursive: true);
+      final children = await listDirectory(normalizedSource, worktree: worktree, recursive: true);
       
       // Copy directory itself
-      final dirId = await createDirectory(normalizedDest, sessionId: sessionId, metadata: source.metadata);
+      final dirId = await createDirectory(normalizedDest, worktree: worktree, metadata: source.metadata);
 
       // Copy all children
       for (final child in children) {
         if (child.path == normalizedSource) continue;
         final relativePath = child.path.substring(normalizedSource.length);
         final newPath = '$normalizedDest$relativePath';
-        await writeFile(newPath, child.content, sessionId: sessionId, metadata: child.metadata);
+        await writeFile(newPath, child.content, worktree: worktree, metadata: child.metadata);
       }
 
       return dirId;
     } else {
-      return writeFile(destPath, source.content, sessionId: sessionId, metadata: source.metadata);
+      return writeFile(destPath, source.content, worktree: worktree, metadata: source.metadata);
     }
   }
 
   /// Deletes a file or directory (marks as deleted).
-  Future<void> deleteFile(String path, {String? session_id, bool recursive = false}) async {
+  Future<void> deleteFile(String path, {String? worktree, bool recursive = false}) async {
     // Try reading as file first, then as directory
-    var file = await readFile(path, sessionId: sessionId);
+    var file = await readFile(path, worktree: worktree);
     if (file == null) {
       // Try with trailing slash (directory)
-      file = await readFile(_normalizeDirPath(path), sessionId: sessionId);
+      file = await readFile(_normalizeDirPath(path), worktree: worktree);
       if (file == null) {
         throw Exception('File not found: $path');
       }
@@ -322,33 +319,33 @@ class FileStorage {
       final normalizedPath = _normalizeDirPath(path);
       if (!recursive) {
         // Check if directory is empty
-        final children = await listDirectory(normalizedPath, sessionId: sessionId);
+        final children = await listDirectory(normalizedPath, worktree: worktree);
         if (children.isNotEmpty) {
           throw Exception('Directory not empty: $path. Use recursive=true to delete non-empty directories.');
         }
       } else {
         // Delete all children recursively
-        final children = await listDirectory(normalizedPath, sessionId: sessionId, recursive: true);
+        final children = await listDirectory(normalizedPath, worktree: worktree, recursive: true);
         
         for (final child in children) {
-          await _markDeleted(child.path, sessionId: sessionId);
+          await _markDeleted(child.path, worktree: worktree);
         }
       }
 
       // Delete the directory itself
-      await _markDeleted(normalizedPath, sessionId: sessionId);
+      await _markDeleted(normalizedPath, worktree: worktree);
     } else {
-      await _markDeleted(path, sessionId: sessionId);
+      await _markDeleted(path, worktree: worktree);
     }
   }
 
   /// Gets metadata for a file or directory.
-  Future<FileMetadata?> getMetadata(String path, {String? sessionId}) async {
+  Future<FileMetadata?> getMetadata(String path, {String? worktree}) async {
     // Try reading as file first, then as directory
-    var file = await readFile(path, sessionId: sessionId);
+    var file = await readFile(path, worktree: worktree);
     if (file == null) {
       // Try with trailing slash (directory)
-      file = await readFile(_normalizeDirPath(path), sessionId: sessionId);
+      file = await readFile(_normalizeDirPath(path), worktree: worktree);
       if (file == null) return null;
     }
 
@@ -356,7 +353,7 @@ class FileStorage {
     int? childCount;
 
     if (file.isDirectory) {
-      final children = await listDirectory(path, sessionId: sessionId);
+      final children = await listDirectory(path, worktree: worktree);
       childCount = children.where((c) => c.path != _normalizeDirPath(path)).length;
       size = 0;
     } else {
@@ -369,21 +366,21 @@ class FileStorage {
       size: size,
       createdAt: file.createdAt,
       version: file.version,
-      sessionId: file.sessionId,
+      worktree: file.worktree,
       childCount: childCount,
       customMetadata: file.metadata,
     );
   }
 
   /// Gets all versions of a file.
-  Future<List<FileRecord>> getFileHistory(String path, {String? sessionId}) async {
-    final whereClause = sessionId != null
-        ? 'path = ? AND session_id = ?'
+  Future<List<FileRecord>> getFileHistory(String path, {String? worktree}) async {
+    final whereClause = worktree != null
+        ? 'path = ? AND worktree = ?'
         : 'path = ?';
-    final params = sessionId != null ? [path, session_id] : [path];
+    final params = worktree != null ? [path, worktree] : [path];
 
     final result = await _db.getAll(
-      'SELECT id, path, content, created_at, session_id, version, is_directory, metadata FROM files '
+      'SELECT id, path, content, created_at, worktree, version, is_directory, metadata FROM files '
       'WHERE $whereClause ORDER BY version DESC',
       params,
     );
@@ -393,7 +390,7 @@ class FileStorage {
       path: row['path'] as String,
       content: row['content'] as List<int>,
       createdAt: DateTime.fromMillisecondsSinceEpoch(row['created_at'] as int),
-      sessionId: row["session_id"] as String?,
+      worktree: row['worktree'] as String?,
       version: row['version'] as int,
       isDirectory: (row['is_directory'] as int) == 1,
       metadata: row['metadata'] as String?,
@@ -401,106 +398,32 @@ class FileStorage {
   }
 
   /// Checks if a path exists.
-  Future<bool> exists(String path, {String? sessionId}) async {
-    final file = await readFile(path, sessionId: sessionId);
+  Future<bool> exists(String path, {String? worktree}) async {
+    final file = await readFile(path, worktree: worktree);
     return file != null;
   }
 
-  /// Lists all session_ids in the database.
-  Future<List<String>> listSessions() async {
-    // Get session_ids that have at least one non-deleted file in latest version
+  /// Lists all worktrees in the database.
+  Future<List<String>> listWorktrees() async {
+    // Get worktrees that have at least one non-deleted file in latest version
     final result = await _db.getAll('''
-      SELECT DISTINCT session_id
+      SELECT DISTINCT worktree
       FROM files f1
-      WHERE session_id IS NOT NULL
+      WHERE worktree IS NOT NULL
         AND is_deleted = 0
         AND version = (
           SELECT MAX(version)
           FROM files f2
           WHERE f2.path = f1.path
-            AND f2.session_id = f1.session_id
+            AND f2.worktree = f1.worktree
         )
-      ORDER BY session_id
+      ORDER BY worktree
     ''');
-    return result.map((row) => row["session_id"] as String).toList();
-  }
-
-  /// Exports a session as a ZIP file.
-  /// Returns the path to the created ZIP file.
-  Future<String> exportSessionZip(String sessionId, {String? outputDir}) async {
-    // Get all files in the session
-    final files = await listDirectory('/', sessionId: sessionId, recursive: true);
-    
-    if (files.isEmpty) {
-      throw Exception('Session not found or empty: $sessionId');
-    }
-
-    // Create ZIP archive
-    final archive = Archive();
-
-    for (final file in files) {
-      if (!file.isDirectory) {
-        // Remove leading slash from path
-        final relativePath = file.path.startsWith('/') ? file.path.substring(1) : file.path;
-        
-        // Add file to archive
-        final archiveFile = ArchiveFile(
-          relativePath,
-          file.content.length,
-          Uint8List.fromList(file.content),
-        );
-        archiveFile.lastModTime = file.createdAt.millisecondsSinceEpoch ~/ 1000;
-        archive.addFile(archiveFile);
-      }
-    }
-
-    // Encode ZIP
-    final zipEncoder = ZipEncoder();
-    final zipBytes = zipEncoder.encode(archive);
-
-    if (zipBytes == null) {
-      throw Exception('Failed to create ZIP archive');
-    }
-
-    // Generate output filename
-    final timestamp = DateTime.now().toIso8601String().split('T')[0];
-    final filename = 'threadbox-session-$sessionId-$timestamp.zip';
-    
-    // Determine output directory
-    final dir = outputDir ?? Directory.current.path;
-    final outputPath = p.join(dir, filename);
-
-    // Write ZIP file
-    final file = File(outputPath);
-    await file.writeAsBytes(zipBytes);
-
-    return outputPath;
-  }
-
-  /// Dumps all session information for debugging.
-  Future<Map<String, dynamic>> dumpSessions() async {
-    final sessions = await listSessions();
-    final result = <String, dynamic>{};
-
-    for (final sessionId in sessions) {
-      final files = await listDirectory('/', sessionId: sessionId, recursive: true);
-      result[sessionId] = {
-        'fileCount': files.length,
-        'files': files.map((f) => {
-          'path': f.path,
-          'isDirectory': f.isDirectory,
-          'version': f.version,
-          'size': f.content.length,
-          'createdAt': f.createdAt.toIso8601String(),
-        }).toList(),
-      };
-    }
-
-    return result;
+    return result.map((row) => row['worktree'] as String).toList();
   }
 
   /// Marks a file as deleted by creating a new version with is_deleted flag.
-  Future<void> _markDeleted(String path, {String? sessionId}) async {
+  Future<void> _markDeleted(String path, {String? worktree}) async {
     final id = _uuid.v4();
     final timestamp = DateTime.now().millisecondsSinceEpoch;
     final parentPath = _getParentPath(path);
@@ -515,9 +438,9 @@ class FileStorage {
         : 1;
 
     await _db.execute(
-      'INSERT INTO files (id, path, content, created_at, session_id, version, is_deleted, parent_path, is_directory) '
+      'INSERT INTO files (id, path, content, created_at, worktree, version, is_deleted, parent_path, is_directory) '
       'VALUES (?, ?, ?, ?, ?, ?, 1, ?, 0)',
-      [id, path, <int>[], timestamp, sessionId, version, parentPath],
+      [id, path, <int>[], timestamp, worktree, version, parentPath],
     );
   }
 
@@ -544,10 +467,7 @@ class FileRecord {
   final String path;
   final List<int> content;
   final DateTime createdAt;
-  final String? sessionId;
-  
-  // Helper for database column name
-  String? get session_id => sessionId;
+  final String? worktree;
   final int version;
   final bool isDirectory;
   final String? metadata;
@@ -557,7 +477,7 @@ class FileRecord {
     required this.path,
     required this.content,
     required this.createdAt,
-    this.sessionId,
+    this.worktree,
     required this.version,
     this.isDirectory = false,
     this.metadata,
@@ -571,7 +491,7 @@ class FileMetadata {
   final int size;
   final DateTime createdAt;
   final int version;
-  final String? sessionId;
+  final String? worktree;
   final int? childCount;
   final String? customMetadata;
 
@@ -581,7 +501,7 @@ class FileMetadata {
     required this.size,
     required this.createdAt,
     required this.version,
-    this.sessionId,
+    this.worktree,
     this.childCount,
     this.customMetadata,
   });
@@ -592,7 +512,7 @@ class FileMetadata {
     'size': size,
     'createdAt': createdAt.toIso8601String(),
     'version': version,
-    'sessionId': sessionId,
+    'worktree': worktree,
     'childCount': childCount,
     'customMetadata': customMetadata,
   };
