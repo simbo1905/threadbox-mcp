@@ -4,7 +4,7 @@ version: 0.1.0
 repository: https://github.com/simbo1905/threadbox-mcp
 
 environment:
-  sdk: ^3.9.4
+  sdk: ^3.9.2
 
 dependencies:
   dart_mcp: ^0.3.3
