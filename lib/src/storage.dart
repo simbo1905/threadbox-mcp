@@ -1,12 +1,16 @@
 // Copyright (c) 2025, ThreadBox MCP contributors.
+//
+// Storage layer for ThreadBox using sqlite_async with UUID-based addressing.
 
-/// Storage layer for ThreadBox using sqlite_async with UUID-based addressing.
 library;
 
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 import 'dart:typed_data';
 
+import 'package:archive/archive.dart';
+import 'package:path/path.dart' as p;
 import 'package:sqlite3/common.dart' as sqlite;
 import 'package:sqlite_async/sqlite_async.dart';
 import 'package:uuid/uuid.dart';
@@ -35,6 +39,7 @@ class VirtualEntry {
     required this.updatedAt,
     required this.worktree,
     this.parentPath,
+    this.version,
     this.content,
   });
 
@@ -46,6 +51,7 @@ class VirtualEntry {
   final DateTime updatedAt;
   final String worktree;
   final String? parentPath;
+  final int? version;
   final Uint8List? content;
 
   Map<String, Object?> toJson({bool includeContent = false}) {
@@ -58,10 +64,36 @@ class VirtualEntry {
       'createdAt': createdAt.toIso8601String(),
       'updatedAt': updatedAt.toIso8601String(),
       'worktree': worktree.isEmpty ? null : worktree,
+      if (version != null) 'version': version,
       if (includeContent && content != null)
         'content': base64Encode(content!),
     };
   }
+}
+
+/// Represents a historical version of a file.
+class FileVersion {
+  FileVersion({
+    required this.id,
+    required this.nodeId,
+    required this.version,
+    required this.content,
+    required this.createdAt,
+  });
+
+  final String id;
+  final String nodeId;
+  final int version;
+  final Uint8List content;
+  final DateTime createdAt;
+}
+
+/// Organized listing of a directory.
+class DirectoryListing {
+  const DirectoryListing({required this.directories, required this.files});
+
+  final List<VirtualEntry> directories;
+  final List<VirtualEntry> files;
 }
 
 /// Manages virtual filesystem state backed by sqlite_async.
@@ -88,10 +120,21 @@ class FileStorage {
           name TEXT NOT NULL,
           parent_path TEXT,
           type TEXT NOT NULL CHECK (type IN ('file', 'directory')),
-          content BLOB,
           created_at INTEGER NOT NULL,
           updated_at INTEGER NOT NULL,
-          worktree TEXT NOT NULL DEFAULT ''
+          worktree TEXT NOT NULL DEFAULT '',
+          latest_version INTEGER
+        )
+      ''');
+
+      await tx.execute('''
+        CREATE TABLE IF NOT EXISTS file_versions (
+          id TEXT PRIMARY KEY,
+          node_id TEXT NOT NULL,
+          version INTEGER NOT NULL,
+          content BLOB NOT NULL,
+          created_at INTEGER NOT NULL,
+          FOREIGN KEY(node_id) REFERENCES nodes(id)
         )
       ''');
 
@@ -105,152 +148,284 @@ class FileStorage {
         ON nodes(worktree, parent_path)
       ''');
 
+      await tx.execute('''
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_versions_node_version
+        ON file_versions(node_id, version)
+      ''');
+
       await _ensureWorktreeRoot(tx, '');
     });
   }
 
-  /// Creates a file at [path] with [content].
-  Future<VirtualEntry> createFile(
+  /// Writes a file at [path] with [content], preserving version history.
+  Future<VirtualEntry> writeFile(
     String path,
     List<int> content, {
-    String? worktree,
+    String? sessionId,
   }) async {
-    final normalizedWorktree = _normalizeWorktree(worktree);
+    final worktree = _normalizeWorktree(sessionId);
     final normalizedPath = _normalizePath(path);
     final parent = _parentPath(normalizedPath);
     final now = _timestamp();
-    final name = _basename(normalizedPath);
+    final bytes = Uint8List.fromList(List<int>.from(content));
 
     return _db.writeTransaction((tx) async {
-      await _ensureWorktreeRoot(tx, normalizedWorktree);
+      await _ensureWorktreeRoot(tx, worktree);
       if (parent != null) {
-        await _ensureDirectory(tx, parent, normalizedWorktree);
+        await _ensureDirectory(tx, parent, worktree);
       }
 
       final existing = await tx.getOptional(
-        'SELECT id FROM nodes WHERE worktree = ? AND path = ?',
-        [normalizedWorktree, normalizedPath],
+        'SELECT * FROM nodes WHERE worktree = ? AND path = ?',
+        [worktree, normalizedPath],
       );
-      if (existing != null) {
-        throw StorageException('A node already exists at $normalizedPath');
+
+      String nodeId;
+      int nextVersion;
+
+      if (existing == null) {
+        nodeId = _uuid.v4();
+        nextVersion = 1;
+        await tx.execute(
+          '''
+          INSERT INTO nodes (
+            id, path, name, parent_path, type, created_at, updated_at, worktree, latest_version
+          )
+          VALUES (?, ?, ?, ?, 'file', ?, ?, ?, ?)
+          ''',
+          [
+            nodeId,
+            normalizedPath,
+            _basename(normalizedPath),
+            parent,
+            now,
+            now,
+            worktree,
+            nextVersion,
+          ],
+        );
+      } else {
+        if ((existing['type'] as String) != 'file') {
+          throw StorageException('Cannot overwrite directory $normalizedPath');
+        }
+
+        nodeId = existing['id'] as String;
+        final currentVersion = existing['latest_version'] as int? ?? 0;
+        nextVersion = currentVersion + 1;
+        await tx.execute(
+          '''
+          UPDATE nodes
+          SET updated_at = ?, latest_version = ?
+          WHERE id = ?
+          ''',
+          [now, nextVersion, nodeId],
+        );
       }
 
-      final id = _uuid.v4();
-      final bytes = Uint8List.fromList(List<int>.from(content));
       await tx.execute(
         '''
-        INSERT INTO nodes (
-          id, path, name, parent_path, type, content,
-          created_at, updated_at, worktree
-        )
-        VALUES (?, ?, ?, ?, 'file', ?, ?, ?, ?)
+        INSERT INTO file_versions (id, node_id, version, content, created_at)
+        VALUES (?, ?, ?, ?, ?)
         ''',
-        [
-          id,
-          normalizedPath,
-          name,
-          parent,
-          bytes,
-          now,
-          now,
-          normalizedWorktree,
-        ],
+        [_uuid.v4(), nodeId, nextVersion, bytes, now],
       );
 
-      return VirtualEntry(
-        id: id,
-        path: normalizedPath,
-        name: name,
-        parentPath: parent,
-        type: NodeType.file,
-        content: bytes,
-        createdAt: DateTime.fromMillisecondsSinceEpoch(now),
-        updatedAt: DateTime.fromMillisecondsSinceEpoch(now),
-        worktree: normalizedWorktree,
+      final row = await tx.get(
+        '''
+        SELECT n.*, v.content
+        FROM nodes n
+        JOIN file_versions v ON v.node_id = n.id AND v.version = n.latest_version
+        WHERE n.id = ?
+        ''',
+        [nodeId],
       );
+
+      return _rowToEntry(row);
     });
   }
 
-  /// Reads a file entry located at [path].
-  Future<VirtualEntry?> readFile(String path, {String? worktree}) async {
-    final normalizedWorktree = _normalizeWorktree(worktree);
+  /// Reads the latest version of the file at [path].
+  Future<VirtualEntry?> readFile(
+    String path, {
+    String? sessionId,
+  }) async {
+    final worktree = _normalizeWorktree(sessionId);
     final normalizedPath = _normalizePath(path);
 
     final row = await _db.getOptional(
       '''
-      SELECT *
-      FROM nodes
-      WHERE worktree = ? AND path = ? AND type = 'file'
+      SELECT n.*, v.content
+      FROM nodes n
+      JOIN file_versions v ON v.node_id = n.id AND v.version = n.latest_version
+      WHERE n.worktree = ? AND n.path = ? AND n.type = 'file'
       ''',
-      [normalizedWorktree, normalizedPath],
+      [worktree, normalizedPath],
     );
 
     if (row == null) return null;
     return _rowToEntry(row);
   }
 
-  /// Lists all direct children of the directory at [dirPath].
-  Future<List<VirtualEntry>> listDirectory(
+  /// Lists the direct children of [dirPath].
+  Future<DirectoryListing> listDirectory(
     String dirPath, {
-    String? worktree,
+    String? sessionId,
   }) async {
-    final normalizedWorktree = _normalizeWorktree(worktree);
+    final worktree = _normalizeWorktree(sessionId);
     final normalizedPath = _normalizePath(dirPath);
 
-    await _assertDirectoryExists(normalizedPath, normalizedWorktree);
+    await _assertDirectoryExists(normalizedPath, worktree);
 
     final rows = await _db.getAll(
       '''
-      SELECT *
-      FROM nodes
-      WHERE worktree = ? AND parent_path = ?
-      ORDER BY type DESC, name ASC
+      SELECT n.*, v.content
+      FROM nodes n
+      LEFT JOIN file_versions v
+        ON v.node_id = n.id AND v.version = n.latest_version
+      WHERE n.worktree = ? AND n.parent_path = ?
+      ORDER BY n.type DESC, n.name ASC
       ''',
-      [normalizedWorktree, normalizedPath],
+      [worktree, normalizedPath == '/' ? '/' : normalizedPath],
     );
 
-    return rows.map(_rowToEntry).toList();
+    final entries = rows.map(_rowToEntry).toList();
+    final directories =
+        entries.where((entry) => entry.type == NodeType.directory).toList();
+    final files =
+        entries.where((entry) => entry.type == NodeType.file).toList();
+    return DirectoryListing(directories: directories, files: files);
   }
 
-  /// Renames the node at [path] to [newName] within the same directory.
+  /// Renames a file to [newName] within the same directory.
   Future<VirtualEntry> renameNode(
     String path,
     String newName, {
-    String? worktree,
+    String? sessionId,
   }) async {
-    final normalizedName = _normalizeName(newName);
-    final normalizedWorktree = _normalizeWorktree(worktree);
+    final worktree = _normalizeWorktree(sessionId);
     final normalizedPath = _normalizePath(path);
+    final normalizedName = _normalizeName(newName);
     final parent = _parentPath(normalizedPath);
     if (parent == null) {
       throw StorageException('Cannot rename the root directory');
     }
 
     final targetPath = _joinPath(parent, normalizedName);
-    return _updatePath(normalizedPath, targetPath, normalizedWorktree);
+    return _moveOrRename(normalizedPath, targetPath, worktree);
   }
 
-  /// Moves the node at [path] to a new parent directory located at [newDirectoryPath].
+  /// Moves a node to [targetDirectory].
   Future<VirtualEntry> moveNode(
     String path,
-    String newDirectoryPath, {
-    String? worktree,
+    String targetDirectory, {
+    String? sessionId,
   }) async {
-    final normalizedWorktree = _normalizeWorktree(worktree);
+    final worktree = _normalizeWorktree(sessionId);
     final normalizedPath = _normalizePath(path);
-    final name = _basename(normalizedPath);
-    final targetDirectory = _normalizePath(newDirectoryPath);
-    if (targetDirectory == normalizedPath) {
+    final normalizedTargetDir = _normalizePath(targetDirectory);
+    if (normalizedTargetDir == normalizedPath) {
       throw StorageException('Destination directory matches the file path');
     }
-    final targetPath = _joinPath(targetDirectory, name);
-    return _updatePath(normalizedPath, targetPath, normalizedWorktree);
+    final name = _basename(normalizedPath);
+    final targetPath = _joinPath(normalizedTargetDir, name);
+    return _moveOrRename(normalizedPath, targetPath, worktree);
+  }
+
+  /// Exports all files for [sessionId] to a ZIP archive.
+  Future<String> exportSessionZip(
+    String? sessionId, {
+    String? destinationDir,
+  }) async {
+    final worktree = _normalizeWorktree(sessionId);
+    final rows = await _db.getAll(
+      '''
+      SELECT n.path, v.content
+      FROM nodes n
+      JOIN file_versions v ON v.node_id = n.id AND v.version = n.latest_version
+      WHERE n.worktree = ? AND n.type = 'file'
+      ORDER BY n.path
+      ''',
+      [worktree],
+    );
+
+    final archive = Archive();
+    for (final row in rows) {
+      final fullPath = row['path'] as String;
+      final content = _toBytes(row['content']);
+      final relativePath =
+          fullPath.startsWith('/') ? fullPath.substring(1) : fullPath;
+      archive.addFile(ArchiveFile(relativePath, content.length, content));
+    }
+
+    final encoder = ZipEncoder();
+    final encoded = encoder.encode(archive) ?? Uint8List(0);
+
+    final root = destinationDir == null
+        ? Directory.systemTemp
+        : Directory(destinationDir);
+    if (!root.existsSync()) {
+      root.createSync(recursive: true);
+    }
+
+    final safeSession =
+        worktree.isEmpty ? 'default' : _sanitizeFileName(worktree);
+    final timestamp = DateTime.now()
+        .toIso8601String()
+        .replaceAll(':', '-')
+        .replaceAll('.', '-');
+    final filename = 'threadbox-session-$safeSession-$timestamp.zip';
+    final outputPath = p.join(root.path, filename);
+    final file = File(outputPath)..writeAsBytesSync(encoded, flush: true);
+    return file.path;
+  }
+
+  /// Returns the full history for a file at [path].
+  Future<List<FileVersion>> getFileHistory(
+    String path, {
+    String? sessionId,
+  }) async {
+    final worktree = _normalizeWorktree(sessionId);
+    final normalizedPath = _normalizePath(path);
+
+    final node = await _db.getOptional(
+      '''
+      SELECT id
+      FROM nodes
+      WHERE worktree = ? AND path = ? AND type = 'file'
+      ''',
+      [worktree, normalizedPath],
+    );
+    if (node == null) return const [];
+
+    final rows = await _db.getAll(
+      '''
+      SELECT *
+      FROM file_versions
+      WHERE node_id = ?
+      ORDER BY version DESC
+      ''',
+      [node['id'] as String],
+    );
+
+    return rows
+        .map(
+          (row) => FileVersion(
+            id: row['id'] as String,
+            nodeId: row['node_id'] as String,
+            version: row['version'] as int,
+            content: _toBytes(row['content']),
+            createdAt: DateTime.fromMillisecondsSinceEpoch(
+              row['created_at'] as int,
+            ),
+          ),
+        )
+        .toList();
   }
 
   /// Closes the underlying sqlite database connections.
   Future<void> close() => _db.close();
 
-  Future<VirtualEntry> _updatePath(
+  Future<VirtualEntry> _moveOrRename(
     String fromPath,
     String toPath,
     String worktree,
@@ -259,8 +434,7 @@ class FileStorage {
       throw StorageException('Cannot move the root directory');
     }
 
-    final normalizedTarget = _normalizePath(toPath);
-    final newParent = _parentPath(normalizedTarget);
+    final newParent = _parentPath(toPath);
     if (newParent == null) {
       throw StorageException('Files must reside inside a directory');
     }
@@ -276,17 +450,18 @@ class FileStorage {
         throw StorageException('No node found at $fromPath');
       }
 
-      final type = source['type'] as String;
-      if (type != 'file') {
-        throw StorageException('Only file nodes can be moved in this release');
+      if ((source['type'] as String) != 'file') {
+        throw StorageException(
+          'Only file nodes can be moved or renamed currently',
+        );
       }
 
       final conflict = await tx.getOptional(
         'SELECT id FROM nodes WHERE worktree = ? AND path = ?',
-        [worktree, normalizedTarget],
+        [worktree, toPath],
       );
       if (conflict != null) {
-        throw StorageException('A node already exists at $normalizedTarget');
+        throw StorageException('A node already exists at $toPath');
       }
 
       await _ensureDirectory(tx, newParent, worktree);
@@ -299,20 +474,26 @@ class FileStorage {
         WHERE id = ?
         ''',
         [
-          normalizedTarget,
-          _basename(normalizedTarget),
+          toPath,
+          _basename(toPath),
           newParent,
           now,
           source['id'] as String,
         ],
       );
 
-      final updated = await tx.get(
-        'SELECT * FROM nodes WHERE id = ?',
+      final row = await tx.get(
+        '''
+        SELECT n.*, v.content
+        FROM nodes n
+        LEFT JOIN file_versions v
+          ON v.node_id = n.id AND v.version = n.latest_version
+        WHERE n.id = ?
+        ''',
         [source['id'] as String],
       );
 
-      return _rowToEntry(updated);
+      return _rowToEntry(row);
     });
   }
 
@@ -330,10 +511,9 @@ class FileStorage {
     await tx.execute(
       '''
       INSERT INTO nodes (
-        id, path, name, parent_path, type, content,
-        created_at, updated_at, worktree
+        id, path, name, parent_path, type, created_at, updated_at, worktree, latest_version
       )
-      VALUES (?, '/', '/', NULL, 'directory', NULL, ?, ?, ?)
+      VALUES (?, '/', '/', NULL, 'directory', ?, ?, ?, NULL)
       ''',
       [_uuid.v4(), now, now, worktree],
     );
@@ -366,10 +546,9 @@ class FileStorage {
         await tx.execute(
           '''
           INSERT INTO nodes (
-            id, path, name, parent_path, type, content,
-            created_at, updated_at, worktree
+            id, path, name, parent_path, type, created_at, updated_at, worktree, latest_version
           )
-          VALUES (?, ?, ?, ?, 'directory', NULL, ?, ?, ?)
+          VALUES (?, ?, ?, ?, 'directory', ?, ?, ?, NULL)
           ''',
           [
             _uuid.v4(),
@@ -429,13 +608,22 @@ class FileStorage {
       name: row['name'] as String,
       parentPath: row['parent_path'] as String?,
       type: type,
-      content: content == null
-          ? null
-          : Uint8List.fromList(List<int>.from(content as List<int>)),
+      version: row['latest_version'] as int?,
+      content: content == null ? null : _toBytes(content),
       createdAt: DateTime.fromMillisecondsSinceEpoch(row['created_at'] as int),
       updatedAt: DateTime.fromMillisecondsSinceEpoch(row['updated_at'] as int),
       worktree: row['worktree'] as String,
     );
+  }
+
+  Uint8List _toBytes(Object value) {
+    if (value is Uint8List) {
+      return Uint8List.fromList(value);
+    }
+    if (value is List<int>) {
+      return Uint8List.fromList(value);
+    }
+    throw StateError('Unexpected BLOB value type: ${value.runtimeType}');
   }
 
   int _timestamp() => DateTime.now().millisecondsSinceEpoch;
@@ -444,22 +632,24 @@ class FileStorage {
       worktree == null ? '' : worktree.trim();
 
   String _normalizePath(String input) {
-    var path = input.trim();
-    if (path.isEmpty) {
+    var normalized = input.trim();
+    if (normalized.isEmpty) {
       throw StorageException('Path cannot be empty');
     }
 
-    path = path.replaceAll(RegExp(r'/+'), '/');
-    if (!path.startsWith('/')) {
-      path = '/$path';
+    normalized = normalized.replaceAll(RegExp(r'/+'), '/');
+    if (!normalized.startsWith('/')) {
+      normalized = '/$normalized';
     }
-    if (path.length > 1 && path.endsWith('/')) {
-      path = path.substring(0, path.length - 1);
+    if (normalized.length > 1 && normalized.endsWith('/')) {
+      normalized = normalized.substring(0, normalized.length - 1);
     }
-    if (path.contains('..')) {
-      throw StorageException('Relative path segments are not supported: $path');
+    if (normalized.contains('..')) {
+      throw StorageException(
+        'Relative path segments are not supported: $normalized',
+      );
     }
-    return path;
+    return normalized;
   }
 
   String _normalizeName(String input) {
@@ -470,8 +660,8 @@ class FileStorage {
     if (name.contains('/')) {
       throw StorageException('Name cannot contain "/" characters');
     }
-    if (name == '.') {
-      throw StorageException('Name cannot be "."');
+    if (name == '.' || name == '..') {
+      throw StorageException('Name cannot be "." or ".."');
     }
     return name;
   }
@@ -501,5 +691,9 @@ class FileStorage {
       return const [];
     }
     return path.substring(1).split('/');
+  }
+
+  String _sanitizeFileName(String input) {
+    return input.replaceAll(RegExp(r'[^A-Za-z0-9_\-]+'), '-');
   }
 }

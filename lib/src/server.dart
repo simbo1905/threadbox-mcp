@@ -5,6 +5,7 @@ library;
 
 import 'dart:async';
 import 'dart:convert';
+import 'dart:typed_data';
 
 import 'package:dart_mcp/server.dart';
 import 'package:meta/meta.dart';
@@ -21,31 +22,32 @@ base class ThreadBoxServer extends MCPServer with ToolsSupport {
         ),
         instructions: 'Virtual filesystem backed by sqlite_async storage.',
       ) {
-    registerTool(createFileTool, _createFile);
+    registerTool(writeFileTool, _writeFile);
     registerTool(readFileTool, _readFile);
     registerTool(listDirectoryTool, _listDirectory);
     registerTool(renameNodeTool, _renameNode);
     registerTool(moveNodeTool, _moveNode);
+    registerTool(exportSessionZipTool, _exportSessionZip);
   }
 
   final FileStorage _storage;
 
   /// Tool for writing files to storage.
-  final createFileTool = Tool(
-    name: 'create_file',
-    description: 'Create a file in the virtual filesystem.',
+  final writeFileTool = Tool(
+    name: 'write_file',
+    description: 'Create or update a file in the virtual filesystem.',
     inputSchema: Schema.object(
       properties: {
         'path': Schema.string(
           description: 'Absolute path of the file to create.',
         ),
         'content': Schema.string(
-          description: 'File contents. Defaults to utf8 unless encoding=base64.',
+          description: 'File contents. UTF-8 by default unless base64=true.',
         ),
-        'encoding': Schema.string(
-          description: 'Content encoding (utf8 or base64). Defaults to utf8.',
+        'base64': Schema.boolean(
+          description: 'Set to true when content is base64 encoded.',
         ),
-        'worktree': Schema.string(
+        'sessionId': Schema.string(
           description: 'Optional isolation key for multi-worktree storage.',
         ),
       },
@@ -62,7 +64,7 @@ base class ThreadBoxServer extends MCPServer with ToolsSupport {
         'path': Schema.string(
           description: 'Absolute path of the file to read.',
         ),
-        'worktree': Schema.string(
+          'sessionId': Schema.string(
           description: 'Optional isolation key for multi-worktree storage.',
         ),
       },
@@ -79,7 +81,7 @@ base class ThreadBoxServer extends MCPServer with ToolsSupport {
         'path': Schema.string(
           description: 'Directory path to list.',
         ),
-        'worktree': Schema.string(
+          'sessionId': Schema.string(
           description: 'Optional isolation key for multi-worktree storage.',
         ),
       },
@@ -99,7 +101,7 @@ base class ThreadBoxServer extends MCPServer with ToolsSupport {
         'newName': Schema.string(
           description: 'New file name (no path segments).',
         ),
-        'worktree': Schema.string(
+        'sessionId': Schema.string(
           description: 'Optional isolation key for multi-worktree storage.',
         ),
       },
@@ -119,7 +121,7 @@ base class ThreadBoxServer extends MCPServer with ToolsSupport {
         'newDirectory': Schema.string(
           description: 'Target directory path.',
         ),
-        'worktree': Schema.string(
+        'sessionId': Schema.string(
           description: 'Optional isolation key for multi-worktree storage.',
         ),
       },
@@ -127,43 +129,84 @@ base class ThreadBoxServer extends MCPServer with ToolsSupport {
     ),
   );
 
-  Future<CallToolResult> _createFile(CallToolRequest request) async {
+  /// Tool for exporting a session as a ZIP archive.
+  final exportSessionZipTool = Tool(
+    name: 'export_session_zip',
+    description: 'Create a ZIP archive containing all files in a session.',
+    inputSchema: Schema.object(
+      properties: {
+        'sessionId': Schema.string(
+          description: 'Optional isolation key for multi-worktree storage.',
+        ),
+        'destination': Schema.string(
+          description: 'Optional filesystem directory to place the archive.',
+        ),
+      },
+    ),
+  );
+
+  Future<CallToolResult> _writeFile(CallToolRequest request) async {
     final args = request.arguments!;
     final path = args['path'] as String;
     final content = args['content'] as String;
-    final encoding = (args['encoding'] as String?)?.toLowerCase() ?? 'utf8';
-    final worktree = args['worktree'] as String?;
+    final isBase64 = args['base64'] as bool? ?? false;
+    final sessionId = args['sessionId'] as String?;
 
     try {
-      final bytes = encoding == 'base64'
+      final bytes = isBase64
           ? base64Decode(content)
           : utf8.encode(content);
-      final entry = await _storage.createFile(
+      final entry = await _storage.writeFile(
         path,
         bytes,
-        worktree: worktree,
+        sessionId: sessionId,
       );
-      return _success(entry.toJson());
+      return _success({
+        'inodeId': entry.id,
+        'path': entry.path,
+        'version': entry.version,
+        'sessionId': sessionId,
+      });
     } on FormatException catch (e) {
       return _error('Failed to decode content for $path: ${e.message}');
     } on StorageException catch (e) {
       return _error(e.message);
     } catch (e) {
-      return _error('Unexpected error creating $path: $e');
+      return _error('Unexpected error writing $path: $e');
     }
   }
 
   Future<CallToolResult> _readFile(CallToolRequest request) async {
     final args = request.arguments!;
     final path = args['path'] as String;
-    final worktree = args['worktree'] as String?;
+    final sessionId = args['sessionId'] as String?;
 
     try {
-      final record = await _storage.readFile(path, worktree: worktree);
+      final record = await _storage.readFile(path, sessionId: sessionId);
       if (record == null) {
         return _error('File not found: $path');
       }
-      return _success(record.toJson(includeContent: true));
+      final bytes = record.content ?? Uint8List(0);
+      try {
+        final decoded = utf8.decode(bytes);
+        return _success({
+          'inodeId': record.id,
+          'path': record.path,
+          'version': record.version,
+          'content': decoded,
+          'base64': false,
+          'sessionId': sessionId,
+        });
+      } on FormatException {
+        return _success({
+          'inodeId': record.id,
+          'path': record.path,
+          'version': record.version,
+          'content': base64Encode(bytes),
+          'base64': true,
+          'sessionId': sessionId,
+        });
+      }
     } on StorageException catch (e) {
       return _error(e.message);
     } catch (e) {
@@ -174,13 +217,32 @@ base class ThreadBoxServer extends MCPServer with ToolsSupport {
   Future<CallToolResult> _listDirectory(CallToolRequest request) async {
     final args = request.arguments!;
     final path = args['path'] as String;
-    final worktree = args['worktree'] as String?;
+    final sessionId = args['sessionId'] as String?;
 
     try {
-      final entries = await _storage.listDirectory(path, worktree: worktree);
+      final listing = await _storage.listDirectory(path, sessionId: sessionId);
       final payload = {
+        'sessionId': sessionId,
         'path': path,
-        'entries': [for (final entry in entries) entry.toJson()],
+        'directories': [
+          for (final entry in listing.directories)
+            {
+              'name': entry.name,
+              'path': entry.path,
+              'inodeId': entry.id,
+              'updatedAt': entry.updatedAt.toIso8601String(),
+            }
+        ],
+        'files': [
+          for (final entry in listing.files)
+            {
+              'name': entry.name,
+              'path': entry.path,
+              'inodeId': entry.id,
+              'version': entry.version,
+              'updatedAt': entry.updatedAt.toIso8601String(),
+            }
+        ],
       };
       return _success(payload);
     } on StorageException catch (e) {
@@ -194,15 +256,20 @@ base class ThreadBoxServer extends MCPServer with ToolsSupport {
     final args = request.arguments!;
     final path = args['path'] as String;
     final newName = args['newName'] as String;
-    final worktree = args['worktree'] as String?;
+    final sessionId = args['sessionId'] as String?;
 
     try {
       final entry = await _storage.renameNode(
         path,
         newName,
-        worktree: worktree,
+        sessionId: sessionId,
       );
-      return _success(entry.toJson());
+      return _success({
+        'inodeId': entry.id,
+        'path': entry.path,
+        'version': entry.version,
+        'sessionId': sessionId,
+      });
     } on StorageException catch (e) {
       return _error(e.message);
     } catch (e) {
@@ -214,19 +281,45 @@ base class ThreadBoxServer extends MCPServer with ToolsSupport {
     final args = request.arguments!;
     final path = args['path'] as String;
     final newDirectory = args['newDirectory'] as String;
-    final worktree = args['worktree'] as String?;
+    final sessionId = args['sessionId'] as String?;
 
     try {
       final entry = await _storage.moveNode(
         path,
         newDirectory,
-        worktree: worktree,
+        sessionId: sessionId,
       );
-      return _success(entry.toJson());
+      return _success({
+        'inodeId': entry.id,
+        'path': entry.path,
+        'version': entry.version,
+        'sessionId': sessionId,
+      });
     } on StorageException catch (e) {
       return _error(e.message);
     } catch (e) {
       return _error('Unexpected error moving $path: $e');
+    }
+  }
+
+  Future<CallToolResult> _exportSessionZip(CallToolRequest request) async {
+    final args = request.arguments ?? const <String, Object?>{};
+    final sessionId = args['sessionId'] as String?;
+    final destination = args['destination'] as String?;
+
+    try {
+      final path = await _storage.exportSessionZip(
+        sessionId,
+        destinationDir: destination,
+      );
+      return _success({
+        'sessionId': sessionId,
+        'downloadPath': path,
+      });
+    } on StorageException catch (e) {
+      return _error(e.message);
+    } catch (e) {
+      return _error('Unexpected error exporting session: $e');
     }
   }
 

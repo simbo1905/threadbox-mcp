@@ -9,6 +9,8 @@ environment:
 dependencies:
   dart_mcp: ^0.3.3
   sqlite_async: ^0.13.0
+  archive: ^3.6.1
+  path: ^1.9.0
   uuid: ^4.5.1
 
 dev_dependencies:
