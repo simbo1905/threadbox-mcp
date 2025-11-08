@@ -6,3 +6,4 @@ library;
 
 export 'src/server.dart';
 export 'src/storage.dart';
+export 'src/git_utils.dart';

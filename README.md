@@ -1,94 +1,192 @@
-# threadbox-mcp
+# ThreadBox
 
-ThreadBox: Virtual filesystem for AI agent artefacts. A Dart MCP server providing isolated, versioned sandboxes per Git worktree.
+**A virtual file system for agent artefacts**
 
-## Features
+ThreadBox is an MCP server that provides AI agents with a sandboxed, versioned filesystem—automatically organized by Git worktree so concurrent agents never interfere.
 
-- **MCP Tools**: `write_file`, `read_file`, `list_directory`, `export_zip`
-- **Append-only immutability** with full version history
-- **UUID-based blob addressing** for unique file identification
-- **Git worktree isolation** for session management
-- **Async SQLite storage** for reliable persistence
+- **Virtual filesystem**: Agents create, edit, and manage files in a sandboxed environment
+- **Git-worktree aware**: Each worktree gets isolated sessions automatically
+- **Immutable storage**: Full history of every edit, rename, and overwrite in append-only storage
 
-## Installation
+When you're juggling multiple Git worktrees, your AI agents shouldn't collide. ThreadBox isolates sessions automatically—each worktree gets its own session namespace, keeping agent files separate without any configuration.
 
-Ensure you have Dart SDK installed, then:
-
-```bash
-dart pub get
+```mermaid
+sequenceDiagram
+    participant Agent
+    participant MCP as threadbox mcp
+    participant DB as SQLite
+    participant CLI as threadbox cli
+    participant User as Developer
+    
+    Agent->>MCP: write_file("src/Button.tsx", content)
+    MCP->>DB: store file in session "main"
+    Agent->>MCP: export_session_zip()
+    MCP->>User: "Session ready at abc123"
+    
+    Note over User,CLI: Later, separate invocation
+    
+    User->>CLI: --session abc123 --zip
+    CLI->>DB: read session files
+    CLI->>User: abc123.zip
 ```
 
-## Usage
+### Benefits
 
-Run the MCP server:
+- **Concurrent isolation**: Run agents in parallel on different branches without file conflicts
+- **Single storage location**: All sessions, files, and history in one SQLite database
+- **Full version history**: Every change is preserved—recover previous versions or debug agent behavior
+
+---
+
+## Quick Start
 
 ```bash
-dart run bin/threadbox_mcp.dart
+# Install (single binary)
+curl -fsSL https://github.com/threadbox/threadbox/releases/latest/download/threadbox-linux-amd64 -o threadbox
+chmod +x threadbox
+
+# Add to Claude Desktop
+# ~/.config/claude-desktop/config.json
+{
+  "mcpServers": {
+    "threadbox": {
+      "command": "/path/to/threadbox",
+      "args": ["--mcp-server"]
+    }
+  }
+}
+
+# Start chatting—Claude can now create files in a sandbox
 ```
 
-Or compile to native executable:
+---
+
+## How It Works
+
+### Session Isolation
+
+ThreadBox uses your Git worktree name as the session ID, but stores all data centrally:
 
 ```bash
-dart compile exe bin/threadbox_mcp.dart -o threadbox_mcp
-./threadbox_mcp
+# In main branch
+~/project$ threadbox --mcp-server
+# Session ID: "main"
+# Data stored in: $HOME/.threadbox/data/threadbox.db
+
+# In worktree
+~/project-feature$ threadbox --mcp-server  
+# Session ID: "feature-branch"
+# Data stored in: $HOME/.threadbox/data/threadbox.db
+
+# Both run simultaneously—sessions isolated in same DB
+# Deleting a worktree doesn't lose the VFS data
 ```
 
-### Environment Variables
+**No Git?** Uses generic session ID.
 
-- `THREADBOX_DB`: Path to SQLite database file (default: `threadbox.db`)
+### Data Storage
+
+ThreadBox stores everything in a single SQLite database:
+
+- **Default location**: `$HOME/.threadbox/data/threadbox.db`
+- **Override**: `threadbox --mcp-server --data-path /path/to/custom/`
+
+```bash
+# Example structure
+$HOME/.threadbox/
+└── data/
+    └── threadbox.db     # All sessions, inodes, file content
+```
+
+---
+
+## CLI Usage
+
+```bash
+# Export session as zip
+threadbox --session abc123 --zip
+# Creates: threadbox-session-abc123-2024-01-15.zip
+
+# Override data path for this command
+threadbox --session abc123 --zip --data-path /tmp/threadbox
+
+# Debug: dump all session state
+threadbox --dump
+```
+
+---
 
 ## MCP Tools
 
-### write_file
-Writes a file to the virtual filesystem with automatic versioning.
+### `write_file`
 
-**Parameters:**
-- `path` (required): File path relative to the worktree
-- `content` (required): File content (text or base64 encoded)
-- `worktree` (optional): Git worktree identifier for isolation
+```typescript
+{
+  "sessionId": "xyz",
+  "path": "src/Button.tsx",
+  "content": "export const Button = () => <button>Click</button>",
+  "base64": false
+}
+```
 
-### read_file
-Reads the latest version of a file from the virtual filesystem.
+**Returns**: `{ inodeId: "uuid", version: 1 }`
 
-**Parameters:**
-- `path` (required): File path relative to the worktree
-- `worktree` (optional): Git worktree identifier for isolation
+### `read_file`
 
-### list_directory
-Lists all files in a directory from the virtual filesystem.
+```typescript
+{
+  "sessionId": "xyz",
+  "path": "src/Button.tsx"
+}
+```
 
-**Parameters:**
-- `path` (required): Directory path relative to the worktree
-- `worktree` (optional): Git worktree identifier for isolation
+**Returns**: `{ content: "...", base64: false, version: 1, inodeId: "uuid" }`
 
-### export_zip
-Exports files from a directory as a ZIP archive (placeholder).
+### `list_directory`
 
-**Parameters:**
-- `path` (required): Directory path to export
-- `worktree` (optional): Git worktree identifier for isolation
+```typescript
+{
+  "sessionId": "xyz",
+  "path": "src"
+}
+```
+
+**Returns**: 
+```json
+{
+  "directories": ["components", "hooks"],
+  "files": ["index.ts", "types.ts"]
+}
+```
+
+### `export_session_zip`
+
+```typescript
+{
+  "sessionId": "xyz"
+}
+```
+
+**Returns**: `{ downloadPath: "/path/to/session-xyz.zip" }`
+
+---
 
 ## Development
 
-### Running Tests
-
 ```bash
+# Build
+dart compile exe bin/threadbox.dart -o threadbox
+
+# Test
 dart test
 ```
 
-### Linting
-
-```bash
-dart analyze
-```
-
-## Architecture
-
-- **Storage Layer** (`lib/src/storage.dart`): SQLite-based storage with UUID primary keys
-- **MCP Server** (`lib/src/server.dart`): MCP protocol implementation with tool endpoints
-- **Main Entry** (`bin/threadbox_mcp.dart`): Server initialization and startup
+---
 
 ## License
 
-See LICENSE file for details.
+MIT
 
+---
+
+**Alpha Status**: Pre-1.0; APIs and storage may change.
