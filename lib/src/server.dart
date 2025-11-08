@@ -250,32 +250,37 @@ base class ThreadBoxServer extends MCPServer with ToolsSupport {
     final dirPath = request.arguments!['path'] as String;
 
     try {
+      // Normalize directory path
+      final normalizedDirPath = dirPath.endsWith('/') ? dirPath : '$dirPath/';
       final files = await _storage.listDirectory(dirPath, sessionId: sessionId);
 
-      // Build directory structure
+      // Build directory structure - only direct children
       final Set<String> directories = {};
       final List<String> fileList = [];
 
       for (final file in files) {
-        // Remove the directory prefix
-        final relativePath = file.path.startsWith(dirPath)
-            ? file.path.substring(dirPath.length)
-            : file.path;
-        
-        // Remove leading slash
-        final cleanPath = relativePath.startsWith('/')
-            ? relativePath.substring(1)
-            : relativePath;
+        // Get relative path from the directory
+        String relativePath;
+        if (file.path.startsWith(normalizedDirPath)) {
+          relativePath = file.path.substring(normalizedDirPath.length);
+        } else if (file.path.startsWith(dirPath)) {
+          relativePath = file.path.substring(dirPath.length);
+          if (relativePath.startsWith('/')) {
+            relativePath = relativePath.substring(1);
+          }
+        } else {
+          continue; // Not in this directory
+        }
 
-        if (cleanPath.isEmpty) continue;
+        if (relativePath.isEmpty) continue;
 
         // Check if this is a direct child or nested
-        final parts = cleanPath.split('/');
+        final parts = relativePath.split('/');
         if (parts.length == 1) {
           // Direct file
-          fileList.add(cleanPath);
+          fileList.add(parts[0]);
         } else {
-          // Nested - add first directory
+          // Nested - add first directory (direct child)
           directories.add(parts[0]);
         }
       }
