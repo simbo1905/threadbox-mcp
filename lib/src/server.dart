@@ -25,6 +25,8 @@ base class ThreadBoxServer extends MCPServer with ToolsSupport {
     registerTool(readFileTool, _readFile);
     registerTool(listDirectoryTool, _listDirectory);
     registerTool(exportZipTool, _exportZip);
+    registerTool(moveFileTool, _moveFile);
+    registerTool(renameFileTool, _renameFile);
   }
 
   /// Tool for writing files to storage.
@@ -95,6 +97,46 @@ base class ThreadBoxServer extends MCPServer with ToolsSupport {
         ),
       },
       required: ['path'],
+    ),
+  );
+
+  /// Tool for moving files from one path to another.
+  final moveFileTool = Tool(
+    name: 'move_file',
+    description: 'Move a file from one path to another in the virtual filesystem',
+    inputSchema: Schema.object(
+      properties: {
+        'from_path': Schema.string(
+          description: 'The source file path',
+        ),
+        'to_path': Schema.string(
+          description: 'The destination file path',
+        ),
+        'worktree': Schema.string(
+          description: 'Optional Git worktree identifier for isolation',
+        ),
+      },
+      required: ['from_path', 'to_path'],
+    ),
+  );
+
+  /// Tool for renaming files.
+  final renameFileTool = Tool(
+    name: 'rename_file',
+    description: 'Rename a file in the virtual filesystem',
+    inputSchema: Schema.object(
+      properties: {
+        'old_path': Schema.string(
+          description: 'The current file path',
+        ),
+        'new_path': Schema.string(
+          description: 'The new file path',
+        ),
+        'worktree': Schema.string(
+          description: 'Optional Git worktree identifier for isolation',
+        ),
+      },
+      required: ['old_path', 'new_path'],
     ),
   );
 
@@ -225,7 +267,63 @@ base class ThreadBoxServer extends MCPServer with ToolsSupport {
     );
   }
 
-  void dispose() {
-    _storage.close();
+  /// Implementation of move_file tool.
+  FutureOr<CallToolResult> _moveFile(CallToolRequest request) async {
+    final fromPath = request.arguments!['from_path'] as String;
+    final toPath = request.arguments!['to_path'] as String;
+    final worktree = request.arguments!['worktree'] as String?;
+
+    try {
+      final id = await _storage.moveFile(fromPath, toPath, worktree: worktree);
+
+      return CallToolResult(
+        content: [
+          TextContent(
+            text: 'File moved successfully from "$fromPath" to "$toPath" with ID: $id',
+          ),
+        ],
+      );
+    } catch (e) {
+      return CallToolResult(
+        content: [
+          TextContent(
+            text: 'Error moving file: $e',
+          ),
+        ],
+        isError: true,
+      );
+    }
+  }
+
+  /// Implementation of rename_file tool.
+  FutureOr<CallToolResult> _renameFile(CallToolRequest request) async {
+    final oldPath = request.arguments!['old_path'] as String;
+    final newPath = request.arguments!['new_path'] as String;
+    final worktree = request.arguments!['worktree'] as String?;
+
+    try {
+      final id = await _storage.renameFile(oldPath, newPath, worktree: worktree);
+
+      return CallToolResult(
+        content: [
+          TextContent(
+            text: 'File renamed successfully from "$oldPath" to "$newPath" with ID: $id',
+          ),
+        ],
+      );
+    } catch (e) {
+      return CallToolResult(
+        content: [
+          TextContent(
+            text: 'Error renaming file: $e',
+          ),
+        ],
+        isError: true,
+      );
+    }
+  }
+
+  Future<void> dispose() async {
+    await _storage.close();
   }
 }

@@ -4,21 +4,23 @@
 library;
 
 import 'dart:async';
-import 'package:sqlite3/sqlite3.dart';
+import 'package:sqlite_async/sqlite_async.dart';
 import 'package:uuid/uuid.dart';
 
 /// Manages file storage with append-only immutability and version history.
 class FileStorage {
-  final Database _db;
+  final SqliteDatabase _db;
   final Uuid _uuid = const Uuid();
+  bool _initialized = false;
 
-  FileStorage(String dbPath) : _db = sqlite3.open(dbPath) {
-    _initDatabase();
-  }
+  FileStorage(String dbPath) : _db = SqliteDatabase(path: dbPath);
 
-  void _initDatabase() {
+  /// Initialize the database schema.
+  Future<void> _initDatabase() async {
+    if (_initialized) return;
+
     // Create tables for file storage with UUID primary keys
-    _db.execute('''
+    await _db.execute('''
       CREATE TABLE IF NOT EXISTS files (
         id TEXT PRIMARY KEY,
         path TEXT NOT NULL,
@@ -29,29 +31,48 @@ class FileStorage {
       )
     ''');
 
-    _db.execute('''
+    await _db.execute('''
       CREATE INDEX IF NOT EXISTS idx_files_path ON files(path)
     ''');
 
-    _db.execute('''
+    await _db.execute('''
       CREATE INDEX IF NOT EXISTS idx_files_worktree ON files(worktree)
     ''');
+
+    _initialized = true;
+  }
+
+  /// Ensures database is initialized before operations.
+  Future<void> _ensureInitialized() async {
+    if (!_initialized) {
+      await _initDatabase();
+    }
   }
 
   /// Writes a file to storage and returns its UUID.
   Future<String> writeFile(String path, List<int> content, {String? worktree}) async {
+    await _ensureInitialized();
+    
     final id = _uuid.v4();
     final timestamp = DateTime.now().millisecondsSinceEpoch;
 
-    // Get version number for this path
-    final stmt = _db.prepare('SELECT MAX(version) as max_version FROM files WHERE path = ?');
-    final result = stmt.select([path]);
-    final version = result.isNotEmpty && result.first['max_version'] != null
-        ? (result.first['max_version'] as int) + 1
+    // Get version number for this path (considering worktree isolation)
+    final whereClause = worktree != null
+        ? 'path = ? AND worktree = ?'
+        : 'path = ?';
+    final params = worktree != null ? [path, worktree] : [path];
+    
+    final versionResult = await _db.get('''
+      SELECT MAX(version) as max_version 
+      FROM files 
+      WHERE $whereClause
+    ''', params);
+    
+    final version = versionResult != null && versionResult['max_version'] != null
+        ? (versionResult['max_version'] as int) + 1
         : 1;
-    stmt.dispose();
 
-    _db.execute(
+    await _db.execute(
       'INSERT INTO files (id, path, content, created_at, worktree, version) VALUES (?, ?, ?, ?, ?, ?)',
       [id, path, content, timestamp, worktree, version],
     );
@@ -61,22 +82,23 @@ class FileStorage {
 
   /// Reads the latest version of a file by path.
   Future<FileRecord?> readFile(String path, {String? worktree}) async {
+    await _ensureInitialized();
+    
     final whereClause = worktree != null
         ? 'path = ? AND worktree = ?'
         : 'path = ?';
     final params = worktree != null ? [path, worktree] : [path];
 
-    final stmt = _db.prepare(
-      'SELECT id, path, content, created_at, worktree, version FROM files '
-      'WHERE $whereClause ORDER BY version DESC LIMIT 1',
-    );
+    final row = await _db.get('''
+      SELECT id, path, content, created_at, worktree, version 
+      FROM files 
+      WHERE $whereClause 
+      ORDER BY version DESC 
+      LIMIT 1
+    ''', params);
 
-    final result = stmt.select(params);
-    stmt.dispose();
+    if (row == null) return null;
 
-    if (result.isEmpty) return null;
-
-    final row = result.first;
     return FileRecord(
       id: row['id'] as String,
       path: row['path'] as String,
@@ -89,6 +111,8 @@ class FileStorage {
 
   /// Lists all files in a directory.
   Future<List<FileRecord>> listDirectory(String dirPath, {String? worktree}) async {
+    await _ensureInitialized();
+    
     // Normalize directory path
     final normalizedPath = dirPath.endsWith('/') ? dirPath : '$dirPath/';
 
@@ -100,7 +124,7 @@ class FileStorage {
         : ['$normalizedPath%'];
 
     // Get latest versions only
-    final stmt = _db.prepare('''
+    final rows = await _db.getAll('''
       SELECT id, path, content, created_at, worktree, version
       FROM files
       WHERE $whereClause
@@ -111,12 +135,9 @@ class FileStorage {
             ${worktree != null ? 'AND f2.worktree = files.worktree' : ''}
         )
       ORDER BY path
-    ''');
+    ''', params);
 
-    final result = stmt.select(params);
-    stmt.dispose();
-
-    return result.map((row) => FileRecord(
+    return rows.map((row) => FileRecord(
       id: row['id'] as String,
       path: row['path'] as String,
       content: row['content'] as List<int>,
@@ -128,20 +149,21 @@ class FileStorage {
 
   /// Gets all versions of a file.
   Future<List<FileRecord>> getFileHistory(String path, {String? worktree}) async {
+    await _ensureInitialized();
+    
     final whereClause = worktree != null
         ? 'path = ? AND worktree = ?'
         : 'path = ?';
     final params = worktree != null ? [path, worktree] : [path];
 
-    final stmt = _db.prepare(
-      'SELECT id, path, content, created_at, worktree, version FROM files '
-      'WHERE $whereClause ORDER BY version DESC',
-    );
+    final rows = await _db.getAll('''
+      SELECT id, path, content, created_at, worktree, version 
+      FROM files 
+      WHERE $whereClause 
+      ORDER BY version DESC
+    ''', params);
 
-    final result = stmt.select(params);
-    stmt.dispose();
-
-    return result.map((row) => FileRecord(
+    return rows.map((row) => FileRecord(
       id: row['id'] as String,
       path: row['path'] as String,
       content: row['content'] as List<int>,
@@ -151,8 +173,29 @@ class FileStorage {
     )).toList();
   }
 
-  void close() {
-    _db.dispose();
+  /// Moves a file from one path to another.
+  /// Creates a new version at the new path with the same content.
+  Future<String> moveFile(String fromPath, String toPath, {String? worktree}) async {
+    await _ensureInitialized();
+    
+    // Read the latest version of the source file
+    final sourceFile = await readFile(fromPath, worktree: worktree);
+    if (sourceFile == null) {
+      throw Exception('Source file not found: $fromPath');
+    }
+
+    // Write to the new path (this creates a new version)
+    return await writeFile(toPath, sourceFile.content, worktree: worktree);
+  }
+
+  /// Renames a file (alias for moveFile).
+  Future<String> renameFile(String oldPath, String newPath, {String? worktree}) async {
+    return await moveFile(oldPath, newPath, worktree: worktree);
+  }
+
+  /// Closes the database connection.
+  Future<void> close() async {
+    await _db.close();
   }
 }
 

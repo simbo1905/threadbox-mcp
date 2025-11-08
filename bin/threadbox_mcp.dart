@@ -7,7 +7,7 @@ import 'dart:io' as io;
 import 'package:dart_mcp/stdio.dart';
 import 'package:threadbox_mcp/threadbox_mcp.dart';
 
-void main() {
+Future<void> main() async {
   // Initialize storage with default database path
   final dbPath = io.Platform.environment['THREADBOX_DB'] ?? 'threadbox.db';
   final storage = FileStorage(dbPath);
