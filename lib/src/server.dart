@@ -5,42 +5,48 @@ library;
 
 import 'dart:async';
 import 'dart:convert';
+
 import 'package:dart_mcp/server.dart';
+import 'package:meta/meta.dart';
+
 import 'storage.dart';
 
 /// Main MCP server for ThreadBox providing file operations.
 base class ThreadBoxServer extends MCPServer with ToolsSupport {
-  final FileStorage _storage;
-
   ThreadBoxServer(super.channel, this._storage)
     : super.fromStreamChannel(
         implementation: Implementation(
           name: 'ThreadBox MCP Server',
-          version: '0.1.0',
+          version: '0.2.0',
         ),
-        instructions: 'Virtual filesystem for AI agent artifacts with versioned storage',
+        instructions: 'Virtual filesystem backed by sqlite_async storage.',
       ) {
-    // Register MCP tools
-    registerTool(writeFileTool, _writeFile);
+    registerTool(createFileTool, _createFile);
     registerTool(readFileTool, _readFile);
     registerTool(listDirectoryTool, _listDirectory);
-    registerTool(exportZipTool, _exportZip);
+    registerTool(renameNodeTool, _renameNode);
+    registerTool(moveNodeTool, _moveNode);
   }
 
+  final FileStorage _storage;
+
   /// Tool for writing files to storage.
-  final writeFileTool = Tool(
-    name: 'write_file',
-    description: 'Write a file to the virtual filesystem with automatic versioning',
+  final createFileTool = Tool(
+    name: 'create_file',
+    description: 'Create a file in the virtual filesystem.',
     inputSchema: Schema.object(
       properties: {
         'path': Schema.string(
-          description: 'The file path relative to the worktree',
+          description: 'Absolute path of the file to create.',
         ),
         'content': Schema.string(
-          description: 'The file content (text or base64 encoded for binary)',
+          description: 'File contents. Defaults to utf8 unless encoding=base64.',
+        ),
+        'encoding': Schema.string(
+          description: 'Content encoding (utf8 or base64). Defaults to utf8.',
         ),
         'worktree': Schema.string(
-          description: 'Optional Git worktree identifier for isolation',
+          description: 'Optional isolation key for multi-worktree storage.',
         ),
       },
       required: ['path', 'content'],
@@ -50,14 +56,14 @@ base class ThreadBoxServer extends MCPServer with ToolsSupport {
   /// Tool for reading files from storage.
   final readFileTool = Tool(
     name: 'read_file',
-    description: 'Read the latest version of a file from the virtual filesystem',
+    description: 'Read a file from the virtual filesystem.',
     inputSchema: Schema.object(
       properties: {
         'path': Schema.string(
-          description: 'The file path relative to the worktree',
+          description: 'Absolute path of the file to read.',
         ),
         'worktree': Schema.string(
-          description: 'Optional Git worktree identifier for isolation',
+          description: 'Optional isolation key for multi-worktree storage.',
         ),
       },
       required: ['path'],
@@ -67,165 +73,183 @@ base class ThreadBoxServer extends MCPServer with ToolsSupport {
   /// Tool for listing directory contents.
   final listDirectoryTool = Tool(
     name: 'list_directory',
-    description: 'List all files in a directory from the virtual filesystem',
+    description: 'List the direct children of a directory.',
     inputSchema: Schema.object(
       properties: {
         'path': Schema.string(
-          description: 'The directory path relative to the worktree',
+          description: 'Directory path to list.',
         ),
         'worktree': Schema.string(
-          description: 'Optional Git worktree identifier for isolation',
+          description: 'Optional isolation key for multi-worktree storage.',
         ),
       },
       required: ['path'],
     ),
   );
 
-  /// Tool for exporting files as a ZIP archive.
-  final exportZipTool = Tool(
-    name: 'export_zip',
-    description: 'Export files from a directory as a ZIP archive',
+  /// Tool for renaming a node.
+  final renameNodeTool = Tool(
+    name: 'rename_node',
+    description: 'Rename a file while staying in the same directory.',
     inputSchema: Schema.object(
       properties: {
         'path': Schema.string(
-          description: 'The directory path to export',
+          description: 'Existing file path.',
+        ),
+        'newName': Schema.string(
+          description: 'New file name (no path segments).',
         ),
         'worktree': Schema.string(
-          description: 'Optional Git worktree identifier for isolation',
+          description: 'Optional isolation key for multi-worktree storage.',
         ),
       },
-      required: ['path'],
+      required: ['path', 'newName'],
     ),
   );
 
-  /// Implementation of write_file tool.
-  FutureOr<CallToolResult> _writeFile(CallToolRequest request) async {
-    final path = request.arguments!['path'] as String;
-    final content = request.arguments!['content'] as String;
-    final worktree = request.arguments!['worktree'] as String?;
+  /// Tool for moving a node to a different directory.
+  final moveNodeTool = Tool(
+    name: 'move_node',
+    description: 'Move a file to a different directory.',
+    inputSchema: Schema.object(
+      properties: {
+        'path': Schema.string(
+          description: 'Existing file path.',
+        ),
+        'newDirectory': Schema.string(
+          description: 'Target directory path.',
+        ),
+        'worktree': Schema.string(
+          description: 'Optional isolation key for multi-worktree storage.',
+        ),
+      },
+      required: ['path', 'newDirectory'],
+    ),
+  );
+
+  Future<CallToolResult> _createFile(CallToolRequest request) async {
+    final args = request.arguments!;
+    final path = args['path'] as String;
+    final content = args['content'] as String;
+    final encoding = (args['encoding'] as String?)?.toLowerCase() ?? 'utf8';
+    final worktree = args['worktree'] as String?;
 
     try {
-      final contentBytes = utf8.encode(content);
-      final id = await _storage.writeFile(path, contentBytes, worktree: worktree);
-
-      return CallToolResult(
-        content: [
-          TextContent(
-            text: 'File written successfully with ID: $id',
-          ),
-        ],
+      final bytes = encoding == 'base64'
+          ? base64Decode(content)
+          : utf8.encode(content);
+      final entry = await _storage.createFile(
+        path,
+        bytes,
+        worktree: worktree,
       );
+      return _success(entry.toJson());
+    } on FormatException catch (e) {
+      return _error('Failed to decode content for $path: ${e.message}');
+    } on StorageException catch (e) {
+      return _error(e.message);
     } catch (e) {
-      return CallToolResult(
-        content: [
-          TextContent(
-            text: 'Error writing file: $e',
-          ),
-        ],
-        isError: true,
-      );
+      return _error('Unexpected error creating $path: $e');
     }
   }
 
-  /// Implementation of read_file tool.
-  FutureOr<CallToolResult> _readFile(CallToolRequest request) async {
-    final path = request.arguments!['path'] as String;
-    final worktree = request.arguments!['worktree'] as String?;
+  Future<CallToolResult> _readFile(CallToolRequest request) async {
+    final args = request.arguments!;
+    final path = args['path'] as String;
+    final worktree = args['worktree'] as String?;
 
     try {
       final record = await _storage.readFile(path, worktree: worktree);
-
       if (record == null) {
-        return CallToolResult(
-          content: [
-            TextContent(
-              text: 'File not found: $path',
-            ),
-          ],
-          isError: true,
-        );
+        return _error('File not found: $path');
       }
-
-      final content = utf8.decode(record.content);
-      return CallToolResult(
-        content: [
-          TextContent(
-            text: 'File: ${record.path}\n'
-                'Version: ${record.version}\n'
-                'ID: ${record.id}\n'
-                'Created: ${record.createdAt}\n\n'
-                '$content',
-          ),
-        ],
-      );
+      return _success(record.toJson(includeContent: true));
+    } on StorageException catch (e) {
+      return _error(e.message);
     } catch (e) {
-      return CallToolResult(
-        content: [
-          TextContent(
-            text: 'Error reading file: $e',
-          ),
-        ],
-        isError: true,
-      );
+      return _error('Unexpected error reading $path: $e');
     }
   }
 
-  /// Implementation of list_directory tool.
-  FutureOr<CallToolResult> _listDirectory(CallToolRequest request) async {
-    final path = request.arguments!['path'] as String;
-    final worktree = request.arguments!['worktree'] as String?;
+  Future<CallToolResult> _listDirectory(CallToolRequest request) async {
+    final args = request.arguments!;
+    final path = args['path'] as String;
+    final worktree = args['worktree'] as String?;
 
     try {
-      final files = await _storage.listDirectory(path, worktree: worktree);
-
-      if (files.isEmpty) {
-        return CallToolResult(
-          content: [
-            TextContent(
-              text: 'No files found in directory: $path',
-            ),
-          ],
-        );
-      }
-
-      final listing = files.map((f) => '${f.path} (v${f.version}, ${f.id})').join('\n');
-      return CallToolResult(
-        content: [
-          TextContent(
-            text: 'Files in $path:\n$listing',
-          ),
-        ],
-      );
+      final entries = await _storage.listDirectory(path, worktree: worktree);
+      final payload = {
+        'path': path,
+        'entries': [for (final entry in entries) entry.toJson()],
+      };
+      return _success(payload);
+    } on StorageException catch (e) {
+      return _error(e.message);
     } catch (e) {
-      return CallToolResult(
-        content: [
-          TextContent(
-            text: 'Error listing directory: $e',
-          ),
-        ],
-        isError: true,
-      );
+      return _error('Unexpected error listing $path: $e');
     }
   }
 
-  /// Implementation of export_zip tool.
-  FutureOr<CallToolResult> _exportZip(CallToolRequest request) async {
-    final path = request.arguments!['path'] as String;
-    final worktree = request.arguments!['worktree'] as String?;
+  Future<CallToolResult> _renameNode(CallToolRequest request) async {
+    final args = request.arguments!;
+    final path = args['path'] as String;
+    final newName = args['newName'] as String;
+    final worktree = args['worktree'] as String?;
 
-    // Placeholder implementation
-    return CallToolResult(
-      content: [
-        TextContent(
-          text: 'ZIP export functionality will be implemented in future version.\n'
-              'Requested path: $path\n'
-              'Worktree: ${worktree ?? "none"}',
-        ),
-      ],
-    );
+    try {
+      final entry = await _storage.renameNode(
+        path,
+        newName,
+        worktree: worktree,
+      );
+      return _success(entry.toJson());
+    } on StorageException catch (e) {
+      return _error(e.message);
+    } catch (e) {
+      return _error('Unexpected error renaming $path: $e');
+    }
   }
 
-  void dispose() {
-    _storage.close();
+  Future<CallToolResult> _moveNode(CallToolRequest request) async {
+    final args = request.arguments!;
+    final path = args['path'] as String;
+    final newDirectory = args['newDirectory'] as String;
+    final worktree = args['worktree'] as String?;
+
+    try {
+      final entry = await _storage.moveNode(
+        path,
+        newDirectory,
+        worktree: worktree,
+      );
+      return _success(entry.toJson());
+    } on StorageException catch (e) {
+      return _error(e.message);
+    } catch (e) {
+      return _error('Unexpected error moving $path: $e');
+    }
+  }
+
+  Future<void> dispose() => _storage.close();
+
+  CallToolResult _success(Object data) => CallToolResult(
+    content: [TextContent(text: jsonEncode(data))],
+  );
+
+  CallToolResult _error(String message) => CallToolResult(
+    isError: true,
+    content: [TextContent(text: message)],
+  );
+
+  @visibleForTesting
+  Future<CallToolResult> handleToolForTest(
+    String toolName,
+    Map<String, Object?> arguments,
+  ) async {
+    final impl = _registeredToolImpls[toolName];
+    if (impl == null) {
+      throw StateError('No tool registered with the name $toolName');
+    }
+    return impl(CallToolRequest(name: toolName, arguments: arguments));
   }
 }
