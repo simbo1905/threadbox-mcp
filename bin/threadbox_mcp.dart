@@ -4,15 +4,14 @@
 library;
 
 import 'dart:io' as io;
+
 import 'package:dart_mcp/stdio.dart';
 import 'package:threadbox_mcp/threadbox_mcp.dart';
 
-void main() {
-  // Initialize storage with default database path
+Future<void> main() async {
   final dbPath = io.Platform.environment['THREADBOX_DB'] ?? 'threadbox.db';
-  final storage = FileStorage(dbPath);
+  final storage = await FileStorage.open(dbPath);
 
-  // Create and start the MCP server connected to stdio
   ThreadBoxServer(
     stdioChannel(input: io.stdin, output: io.stdout),
     storage,

@@ -2,143 +2,299 @@
 
 import 'dart:convert';
 import 'dart:io';
+
+import 'package:archive/archive.dart';
+import 'package:dart_mcp/api.dart';
+import 'package:stream_channel/stream_channel.dart';
 import 'package:test/test.dart';
 import 'package:threadbox_mcp/threadbox_mcp.dart';
 
 void main() {
-  late FileStorage storage;
-  late String tempDbPath;
-
-  setUp(() {
-    // Create a temporary database for each test
-    tempDbPath = '${Directory.systemTemp.path}/threadbox_test_${DateTime.now().millisecondsSinceEpoch}.db';
-    storage = FileStorage(tempDbPath);
-  });
-
-  tearDown(() {
-    // Clean up
-    storage.close();
-    final dbFile = File(tempDbPath);
-    if (dbFile.existsSync()) {
-      dbFile.deleteSync();
-    }
-  });
-
   group('FileStorage', () {
-    test('writeFile stores content with UUID pk', () async {
-      final content = utf8.encode('Hello, World!');
-      final id = await storage.writeFile('/test/file.txt', content);
+    late FileStorage storage;
+    late String tempDbPath;
 
-      expect(id, isNotNull);
-      expect(id.length, equals(36)); // UUID v4 length
+    setUp(() async {
+      tempDbPath =
+          '${Directory.systemTemp.path}/threadbox_test_${DateTime.now().microsecondsSinceEpoch}.db';
+      storage = await FileStorage.open(tempDbPath);
     });
 
-    test('readFile retrieves latest version', () async {
-      final content1 = utf8.encode('Version 1');
-      final content2 = utf8.encode('Version 2');
-
-      await storage.writeFile('/test/file.txt', content1);
-      await storage.writeFile('/test/file.txt', content2);
-
-      final record = await storage.readFile('/test/file.txt');
-
-      expect(record, isNotNull);
-      expect(record!.version, equals(2));
-      expect(utf8.decode(record.content), equals('Version 2'));
+    tearDown(() async {
+      await storage.close();
+      final dbFile = File(tempDbPath);
+      if (dbFile.existsSync()) {
+        dbFile.deleteSync();
+      }
     });
 
-    test('listDirectory returns files in directory', () async {
-      final content = utf8.encode('Test content');
+    test('writeFile creates new versions when overwriting', () async {
+      final entry1 = await storage.writeFile(
+        '/docs/readme.md',
+        utf8.encode('Version 1'),
+      );
+      expect(entry1.version, equals(1));
 
-      await storage.writeFile('/dir/file1.txt', content);
-      await storage.writeFile('/dir/file2.txt', content);
-      await storage.writeFile('/other/file3.txt', content);
+      final entry2 = await storage.writeFile(
+        '/docs/readme.md',
+        utf8.encode('Version 2'),
+      );
+      expect(entry2.version, equals(2));
 
-      final files = await storage.listDirectory('/dir');
-
-      expect(files.length, equals(2));
-      expect(files.any((f) => f.path == '/dir/file1.txt'), isTrue);
-      expect(files.any((f) => f.path == '/dir/file2.txt'), isTrue);
+      final history = await storage.getFileHistory('/docs/readme.md');
+      expect(history, hasLength(2));
+      expect(history.first.version, equals(2));
+      expect(history.last.version, equals(1));
     });
 
-    test('worktree isolation works correctly', () async {
-      final content1 = utf8.encode('Worktree 1 content');
-      final content2 = utf8.encode('Worktree 2 content');
+    test('listDirectory returns directories and files separately', () async {
+      await storage.writeFile('/dir/a.txt', utf8.encode('A'));
+      await storage.writeFile('/dir/nested/b.txt', utf8.encode('B'));
 
-      await storage.writeFile('/test/file.txt', content1, worktree: 'wt1');
-      await storage.writeFile('/test/file.txt', content2, worktree: 'wt2');
+      final rootListing = await storage.listDirectory('/');
+      expect(
+        rootListing.directories.map((entry) => entry.name).toList(),
+        contains('dir'),
+      );
 
-      final record1 = await storage.readFile('/test/file.txt', worktree: 'wt1');
-      final record2 = await storage.readFile('/test/file.txt', worktree: 'wt2');
-
-      expect(record1, isNotNull);
-      expect(record2, isNotNull);
-      expect(utf8.decode(record1!.content), equals('Worktree 1 content'));
-      expect(utf8.decode(record2!.content), equals('Worktree 2 content'));
+      final dirListing = await storage.listDirectory('/dir');
+      expect(dirListing.files.single.name, equals('a.txt'));
+      expect(dirListing.directories.single.name, equals('nested'));
     });
 
-    test('getFileHistory returns all versions', () async {
-      final content1 = utf8.encode('Version 1');
-      final content2 = utf8.encode('Version 2');
-      final content3 = utf8.encode('Version 3');
+    test('renameNode updates metadata without losing history', () async {
+      await storage.writeFile('/plan.txt', utf8.encode('alpha'));
+      await storage.writeFile('/plan.txt', utf8.encode('beta'));
 
-      await storage.writeFile('/test/file.txt', content1);
-      await storage.writeFile('/test/file.txt', content2);
-      await storage.writeFile('/test/file.txt', content3);
+      final renamed = await storage.renameNode('/plan.txt', 'plan-renamed.txt');
+      expect(renamed.path, equals('/plan-renamed.txt'));
+      expect(renamed.version, equals(2));
 
-      final history = await storage.getFileHistory('/test/file.txt');
-
-      expect(history.length, equals(3));
-      expect(history[0].version, equals(3)); // Most recent first
-      expect(history[1].version, equals(2));
-      expect(history[2].version, equals(1));
+      expect(await storage.readFile('/plan.txt'), isNull);
+      final newRecord = await storage.readFile('/plan-renamed.txt');
+      expect(newRecord, isNotNull);
+      expect(utf8.decode(newRecord!.content!), equals('beta'));
     });
 
-    test('UUID primary key is unique for each write', () async {
-      final content = utf8.encode('Same content');
+    test('moveNode relocates file into existing directory', () async {
+      await storage.writeFile('/drafts/idea.md', utf8.encode('draft'));
+      final moved = await storage.moveNode('/drafts/idea.md', '/archive');
 
-      final id1 = await storage.writeFile('/test/file.txt', content);
-      final id2 = await storage.writeFile('/test/file.txt', content);
+      expect(moved.path, equals('/archive/idea.md'));
+      expect(await storage.readFile('/drafts/idea.md'), isNull);
+      final relocated = await storage.readFile('/archive/idea.md');
+      expect(relocated, isNotNull);
+    });
 
-      expect(id1, isNot(equals(id2)));
+    test('session isolation keeps versions separate', () async {
+      await storage.writeFile(
+        '/shared.txt',
+        utf8.encode('Alpha'),
+        sessionId: 'alpha',
+      );
+      await storage.writeFile(
+        '/shared.txt',
+        utf8.encode('Beta'),
+        sessionId: 'beta',
+      );
+
+      final alpha = await storage.readFile('/shared.txt', sessionId: 'alpha');
+      final beta = await storage.readFile('/shared.txt', sessionId: 'beta');
+
+      expect(alpha, isNotNull);
+      expect(beta, isNotNull);
+      expect(utf8.decode(alpha!.content!), equals('Alpha'));
+      expect(utf8.decode(beta!.content!), equals('Beta'));
+    });
+
+    test('exportSessionZip creates archive with file contents', () async {
+      await storage.writeFile(
+        '/docs/readme.md',
+        utf8.encode('export me'),
+        sessionId: 'session-1',
+      );
+
+      final zipPath = await storage.exportSessionZip('session-1');
+      final file = File(zipPath);
+      addTearDown(() {
+        if (file.existsSync()) {
+          file.deleteSync();
+        }
+      });
+
+      expect(file.existsSync(), isTrue);
+
+      final archive = ZipDecoder().decodeBytes(file.readAsBytesSync());
+      final archiveFile = archive.files.singleWhere(
+        (f) => f.name == 'docs/readme.md',
+      );
+      expect(utf8.decode(archiveFile.content), equals('export me'));
+    });
+
+    test('renameNode throws when destination exists', () async {
+      await storage.writeFile('/a.txt', utf8.encode('A'));
+      await storage.writeFile('/b.txt', utf8.encode('B'));
+
+      await expectLater(
+        () => storage.renameNode('/a.txt', 'b.txt'),
+        throwsA(isA<StorageException>()),
+      );
     });
   });
 
-  group('MCP Tool Endpoints (Placeholder)', () {
-    test('write_file tool functionality', () async {
-      // Placeholder test for write_file MCP tool
-      final content = utf8.encode('Test content');
-      final id = await storage.writeFile('/test.txt', content);
+  group('ThreadBoxServer tools', () {
+    late FileStorage storage;
+    late ThreadBoxServer server;
+    late StreamChannelController<Object?> controller;
+    late String tempDbPath;
 
-      expect(id, isNotNull);
-      expect(id.length, greaterThan(0));
+    setUp(() async {
+      tempDbPath =
+          '${Directory.systemTemp.path}/threadbox_server_${DateTime.now().microsecondsSinceEpoch}.db';
+      storage = await FileStorage.open(tempDbPath);
+      controller = StreamChannelController<Object?>(sync: true);
+      server = ThreadBoxServer(controller.foreign, storage);
     });
 
-    test('read_file tool functionality', () async {
-      // Placeholder test for read_file MCP tool
-      final content = utf8.encode('Test content');
-      await storage.writeFile('/test.txt', content);
-
-      final record = await storage.readFile('/test.txt');
-
-      expect(record, isNotNull);
-      expect(record!.path, equals('/test.txt'));
+    tearDown(() async {
+      await server.dispose();
+      await controller.local.sink.close();
+      await controller.foreign.sink.close();
+      final dbFile = File(tempDbPath);
+      if (dbFile.existsSync()) {
+        dbFile.deleteSync();
+      }
     });
 
-    test('list_directory tool functionality', () async {
-      // Placeholder test for list_directory MCP tool
-      final content = utf8.encode('Test');
-      await storage.writeFile('/dir/file.txt', content);
+    test('write_file returns inode and version', () async {
+      final result = await server.handleToolForTest(
+        'write_file',
+        {
+          'path': '/notes.txt',
+          'content': 'hello world',
+          'sessionId': 'main',
+        },
+      );
 
-      final files = await storage.listDirectory('/dir');
-
-      expect(files, isNotEmpty);
+      final payload = _decodeSuccess(result);
+      expect(payload['inodeId'], isNotEmpty);
+      expect(payload['version'], equals(1));
+      expect(payload['sessionId'], equals('main'));
     });
 
-    test('export_zip tool placeholder', () {
-      // Placeholder test for export_zip MCP tool
-      // Will be implemented with actual ZIP functionality
-      expect(true, isTrue);
+    test('write_file accepts base64 content', () async {
+      final base64Content = base64Encode(utf8.encode('from base64'));
+      final result = await server.handleToolForTest(
+        'write_file',
+        {
+          'path': '/encoded.bin',
+          'content': base64Content,
+          'base64': true,
+          'sessionId': 'main',
+        },
+      );
+
+      final payload = _decodeSuccess(result);
+      expect(payload['path'], equals('/encoded.bin'));
+      expect(payload['version'], equals(1));
+    });
+
+    test('read_file returns utf8 content when possible', () async {
+      await storage.writeFile(
+        '/readme.txt',
+        utf8.encode('content!'),
+        sessionId: 'main',
+      );
+
+      final result = await server.handleToolForTest(
+        'read_file',
+        {'path': '/readme.txt', 'sessionId': 'main'},
+      );
+
+      final payload = _decodeSuccess(result);
+      expect(payload['content'], equals('content!'));
+      expect(payload['base64'], isFalse);
+    });
+
+    test('list_directory returns directories and files metadata', () async {
+      await storage.writeFile('/docs/a.txt', utf8.encode('A'));
+      await storage.writeFile('/docs/b/b.txt', utf8.encode('B'));
+
+      final result = await server.handleToolForTest(
+        'list_directory',
+        {'path': '/docs'},
+      );
+
+      final payload = _decodeSuccess(result);
+      final directories = (payload['directories'] as List).cast<Map>();
+      final files = (payload['files'] as List).cast<Map>();
+
+      expect(files.map((entry) => entry['name']), contains('a.txt'));
+      expect(directories.map((entry) => entry['name']), contains('b'));
+    });
+
+    test('rename_node updates file path', () async {
+      await storage.writeFile('/plan.txt', utf8.encode('secret'));
+
+      final result = await server.handleToolForTest(
+        'rename_node',
+        {'path': '/plan.txt', 'newName': 'manifest.txt'},
+      );
+
+      final payload = _decodeSuccess(result);
+      expect(payload['path'], equals('/manifest.txt'));
+      expect(await storage.readFile('/plan.txt'), isNull);
+    });
+
+    test('move_node relocates file', () async {
+      await storage.writeFile('/draft.txt', utf8.encode('draft'));
+
+      final result = await server.handleToolForTest(
+        'move_node',
+        {'path': '/draft.txt', 'newDirectory': '/projects'},
+      );
+
+      final payload = _decodeSuccess(result);
+      expect(payload['path'], equals('/projects/draft.txt'));
+      expect(await storage.readFile('/projects/draft.txt'), isNotNull);
+    });
+
+    test('export_session_zip returns path to archive', () async {
+      await storage.writeFile('/docs/readme.md', utf8.encode('zip me'));
+
+      final result = await server.handleToolForTest(
+        'export_session_zip',
+        {'sessionId': 'main'},
+      );
+
+      final payload = _decodeSuccess(result);
+      final path = payload['downloadPath'] as String;
+      expect(File(path).existsSync(), isTrue);
+
+      addTearDown(() {
+        final file = File(path);
+        if (file.existsSync()) {
+          file.deleteSync();
+        }
+      });
+    });
+
+    test('tools surface storage errors', () async {
+      final result = await server.handleToolForTest(
+        'read_file',
+        {'path': '/missing.txt'},
+      );
+
+      expect(result.isError, isTrue);
+      final message = (result.content.single as TextContent).text;
+      expect(message, contains('File not found'));
     });
   });
+}
+
+Map<String, dynamic> _decodeSuccess(CallToolResult result) {
+  expect(result.isError ?? false, isFalse);
+  expect(result.content.single, isA<TextContent>());
+  final payload = (result.content.single as TextContent).text;
+  return jsonDecode(payload) as Map<String, dynamic>;
 }
