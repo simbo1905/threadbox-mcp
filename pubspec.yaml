@@ -1,5 +1,5 @@
 name: threadbox_mcp
-description: Virtual filesystem for AI agent artefacts. Dart MCP server providing isolated, versioned sandboxes per Git worktree.
+description: A virtual file system for agent artefacts. MCP server providing sandboxed, versioned filesystem organized by Git worktree.
 version: 0.1.0
 repository: https://github.com/simbo1905/threadbox-mcp
 
@@ -10,6 +10,9 @@ dependencies:
   dart_mcp: ^0.3.3
   sqlite_async: ^0.3.0
   uuid: ^4.5.1
+  archive: ^3.4.0
+  path: ^1.9.0
+  args: ^2.5.0
 
 dev_dependencies:
   lints: ^6.0.0
