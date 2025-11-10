@@ -1,92 +1,85 @@
-# threadbox-mcp
+# Snake Game - Flutter
 
-ThreadBox: Virtual filesystem for AI agent artefacts. A Dart MCP server providing isolated, versioned sandboxes per Git worktree.
+A classic Snake game built with Flutter for Linux desktop.
 
 ## Features
 
-- **MCP Tools**: `write_file`, `read_file`, `list_directory`, `export_zip`
-- **Append-only immutability** with full version history
-- **UUID-based blob addressing** for unique file identification
-- **Git worktree isolation** for session management
-- **Async SQLite storage** for reliable persistence
+- Classic snake gameplay with arrow key controls
+- Score tracking
+- Pause/resume functionality (SPACE key)
+- Game over detection with restart option
+- Smooth animations and modern UI
+- Dark theme with green snake and red food
 
-## Installation
+## Prerequisites
 
-Ensure you have Dart SDK installed, then:
+- Flutter SDK (3.0.0 or higher)
+- Linux desktop support enabled in Flutter
 
+## Setup
+
+1. Ensure Flutter is installed and Linux desktop support is enabled:
+   ```bash
+   flutter doctor
+   flutter config --enable-linux-desktop
+   ```
+
+2. Install dependencies:
+   ```bash
+   flutter pub get
+   ```
+
+3. Generate Linux platform files (if needed):
+   ```bash
+   flutter create --platforms=linux .
+   ```
+
+## Running the Game
+
+Run the game on Linux:
 ```bash
-dart pub get
+flutter run -d linux
 ```
 
-## Usage
-
-Run the MCP server:
-
+Or build a release version:
 ```bash
-dart run bin/threadbox_mcp.dart
+flutter build linux
 ```
 
-Or compile to native executable:
+The executable will be in `build/linux/x64/release/bundle/`.
 
-```bash
-dart compile exe bin/threadbox_mcp.dart -o threadbox_mcp
-./threadbox_mcp
-```
+## Controls
 
-### Environment Variables
+- **Arrow Keys**: Move the snake (Up, Down, Left, Right)
+- **SPACE**: Pause/Resume the game
+- **SPACE** (when game over): Restart the game
 
-- `THREADBOX_DB`: Path to SQLite database file (default: `threadbox.db`)
+## Game Rules
 
-## MCP Tools
+- Control the snake to eat the red food
+- Each food eaten increases your score by 10 points
+- The snake grows longer with each food eaten
+- Avoid hitting the walls or your own tail
+- Game ends on collision
 
-### write_file
-Writes a file to the virtual filesystem with automatic versioning.
+## Project Structure
 
-**Parameters:**
-- `path` (required): File path relative to the worktree
-- `content` (required): File content (text or base64 encoded)
-- `worktree` (optional): Git worktree identifier for isolation
-
-### read_file
-Reads the latest version of a file from the virtual filesystem.
-
-**Parameters:**
-- `path` (required): File path relative to the worktree
-- `worktree` (optional): Git worktree identifier for isolation
-
-### list_directory
-Lists all files in a directory from the virtual filesystem.
-
-**Parameters:**
-- `path` (required): Directory path relative to the worktree
-- `worktree` (optional): Git worktree identifier for isolation
-
-### export_zip
-Exports files from a directory as a ZIP archive (placeholder).
-
-**Parameters:**
-- `path` (required): Directory path to export
-- `worktree` (optional): Git worktree identifier for isolation
+- `lib/main.dart`: Main game logic and UI implementation
+- `pubspec.yaml`: Flutter project configuration
 
 ## Development
 
 ### Running Tests
 
 ```bash
-dart test
+flutter test
 ```
 
 ### Linting
 
 ```bash
-dart analyze
+flutter analyze
 ```
-
-## Architecture
-
-- **Storage Layer** (`lib/src/storage.dart`): SQLite-based storage with UUID primary keys
-- **MCP Server** (`lib/src/server.dart`): MCP protocol implementation with tool endpoints
-- **Main Entry** (`bin/threadbox_mcp.dart`): Server initialization and startup
 
 ## License
 
